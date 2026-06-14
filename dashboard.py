@@ -20,6 +20,32 @@ from execution import TRADE_LOG, performance_summary, _load_log  # noqa: PLC2701
 
 st.set_page_config(page_title="Trading Bot — Paper Mode", page_icon="📈", layout="centered")
 
+# A little polish for the phase pills.
+st.markdown(
+    """
+    <style>
+    [data-testid="stSegmentedControl"] { gap: .35rem; }
+    [data-testid="stSegmentedControl"] button {
+        border-radius: 999px !important;
+        padding: .35rem 1rem !important;
+        font-weight: 600;
+        border: 1px solid rgba(250,250,250,.12) !important;
+        transition: all .15s ease;
+    }
+    [data-testid="stSegmentedControl"] button[aria-checked="true"],
+    [data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] {
+        background: #ef4444 !important;
+        color: #fff !important;
+        border-color: #ef4444 !important;
+    }
+    [data-testid="stSegmentedControl"] button:hover {
+        border-color: #ef4444 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -98,19 +124,35 @@ mode = st.radio(
 )
 discover = mode.startswith("🔍")
 
-col_a, col_b = st.columns([2, 1])
 if discover:
-    col_a.caption(
+    st.caption(
         f"4 scout agents scan live stock + crypto movers and the macro backdrop, "
         f"then the desk trades the top {settings.MAX_CANDIDATES}."
     )
     asset = ""
 else:
-    asset = col_a.text_input("Stock / crypto ticker", value="AAPL").strip().upper()
-phase = col_b.selectbox("Time of day", [p.value for p in MarketPhase], index=1)
+    asset = st.text_input("Stock / crypto ticker", value="AAPL").strip().upper()
+
+# Market-phase picker — pill segmented control instead of a cramped dropdown.
+PHASE_LABELS = {
+    "pre_market": "🌅 Pre-market",
+    "open": "🔔 Open",
+    "mid_day": "☀️ Mid-day",
+    "close": "🌆 Close",
+}
+_phase_values = [p.value for p in MarketPhase]
+st.markdown("**🕑 Time of day**")
+_picked = st.segmented_control(
+    "Time of day",
+    options=_phase_values,
+    format_func=lambda v: PHASE_LABELS.get(v, v),
+    default="open",
+    label_visibility="collapsed",
+)
+phase = _picked or "open"
 
 btn_label = "🛰️  Scout the market & trade" if discover else "▶️  Let the AI agents trade"
-run = st.button(btn_label, type="primary", use_container_width=True)
+run = st.button(btn_label, type="primary", width="stretch")
 
 # Live area for this run.
 feed = st.container()
@@ -160,7 +202,7 @@ if run and (discover or asset):
                             for i in shortlist.ideas
                         ]
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -219,7 +261,7 @@ else:
     cols = [c for c in ["Ticker", "Action", "Entry", "Result", "P/L ($)", "Balance"] if c in nice]
     st.dataframe(
         nice[cols].iloc[::-1].head(15),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
