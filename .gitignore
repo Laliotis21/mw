@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.local
+*.key
+
+# Virtualenvs
+v/
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Trading runtime data / logs
+trade_log.json
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
