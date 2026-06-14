@@ -165,6 +165,26 @@ class MarketScanReport(BaseModel):
     def _fill_ts(cls, v):
         return v or datetime.now(timezone.utc).isoformat()
 
+    @field_validator("key_levels", mode="before")
+    @classmethod
+    def _coerce_levels(cls, v):
+        """LLMs often emit levels as {'value': 124.3, 'type': 'support'} or
+        strings. Flatten anything to a plain list of floats; drop junk."""
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            v = [v]
+        out: List[float] = []
+        for item in v:
+            if isinstance(item, dict):
+                item = item.get("value") or item.get("price") or item.get("level")
+            try:
+                if item is not None:
+                    out.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+
 
 # --------------------------------------------------------------------------- #
 # 2) TradeSignal — Analyst -> Risk Manager
