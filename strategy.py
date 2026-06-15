@@ -181,7 +181,9 @@ def _indicators(asset: str) -> Optional[dict]:
     """
     from candles import fetch_history
 
-    df = fetch_history(asset, "3mo", "1d")
+    # 6mo (~126 bars) so the SMA50 slope (needs >=60 bars) is reliably available
+    # for the trend filter; tail()-based indicators still use only recent bars.
+    df = fetch_history(asset, "6mo", "1d")
     if df is None or df.empty or len(df) < 6:
         return None
     close, high, low = df["Close"], df["High"], df["Low"]
@@ -199,7 +201,9 @@ def _indicators(asset: str) -> Optional[dict]:
     vol = df["Volume"]
     avg_vol = float(vol.tail(min(20, bars)).mean())
     vol_ok = avg_vol <= 0 or float(vol.iloc[-1]) >= 0.7 * avg_vol  # participation
-    er = efficiency_ratio(close, period=min(settings.TREND_ER_WINDOW, bars - 1))
+    # ER only feeds the opt-in chop gate; skip the work when it's disabled.
+    er = (efficiency_ratio(close, period=min(settings.TREND_ER_WINDOW, bars - 1))
+          if settings.TREND_MIN_ER > 0 else 0.0)
     # SMA50 slope for trend alignment: compare the current SMA50 to where it sat
     # ~10 bars ago. None on thin history (we don't gate what we can't measure).
     sma50_rising = float(close.iloc[-60:-10].mean()) < sma50 if bars >= 60 else None
@@ -288,6 +292,12 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     buy = ((up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)) and vol_ok and not extended
     sell = ((down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)) and vol_ok
 
+    if crypto and sell and not buy:  # spot crypto is long-only — never short
+        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
+                           rationale=(f"HOLD: bearish technicals on {asset} but spot crypto "
+                                      f"is long-only (no short). close {last:.2f}, RSI {rsi:.0f}."),
+                           time_horizon="swing")
+
     # Trend-alignment gate (default): don't fight the primary trend. Drop a long
     # when the SMA50 is falling and a short when it's rising — that's where the
     # strategy gets run over (counter-trend whipsaws). A live catalyst already
@@ -313,12 +323,6 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
         return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.25,
                            rationale=(f"HOLD: choppy regime (ER {er:.2f} < {settings.TREND_MIN_ER:.2f}) "
                                       f"— no clean trend to trade. close {last:.2f}, RSI {rsi:.0f}."),
-                           time_horizon="swing")
-
-    if crypto and sell and not buy:  # spot crypto is long-only — never short
-        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
-                           rationale=(f"HOLD: bearish technicals on {asset} but spot crypto "
-                                      f"is long-only (no short). close {last:.2f}, RSI {rsi:.0f}."),
                            time_horizon="swing")
 
     if buy and not sell:

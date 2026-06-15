@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 
+from config import settings
 from strategy import ATR_STOP_MULT, REWARD_RISK, efficiency_ratio, simulate_exit
 
 
@@ -133,18 +134,20 @@ def main() -> int:
     p.add_argument("--asset", action="append", default=[], help="Ticker (repeat).")
     p.add_argument("--days", type=int, default=365)
     p.add_argument("--max-hold", type=int, default=20, help="Max bars to hold a trade.")
-    p.add_argument("--exit-style", choices=["target", "be_partial"], default="target",
+    # Defaults mirror the LIVE config (settings) so a bare `python backtest.py`
+    # measures what the bot actually runs; flags override for A/B experiments.
+    p.add_argument("--exit-style", choices=["target", "be_partial"], default=settings.EXIT_STYLE,
                    help="target = fixed 2R; be_partial = half off at 1R + breakeven stop.")
-    p.add_argument("--trend-min-er", type=float, default=0.0,
+    p.add_argument("--trend-align", action=argparse.BooleanOptionalAction, default=settings.TREND_FILTER,
+                   help="Only trade in the direction of the SMA50 slope (live default). Use --no-trend-align to disable.")
+    p.add_argument("--trend-min-er", type=float, default=settings.TREND_MIN_ER,
                    help="Min Kaufman Efficiency Ratio to take a trade (0 = filter off).")
-    p.add_argument("--er-window", type=int, default=20, help="Efficiency Ratio window (bars).")
-    p.add_argument("--trend-align", action="store_true",
-                   help="Only trade in the direction of the SMA50 slope.")
+    p.add_argument("--er-window", type=int, default=settings.TREND_ER_WINDOW, help="Efficiency Ratio window (bars).")
     a = p.parse_args()
     assets = a.asset or ["AAPL", "MSFT", "NVDA", "SPY", "BTC-USD", "ETH-USD"]
 
     print(f"\nBACKTEST · technical-only (no news) · {a.days}d · max-hold {a.max_hold} bars "
-          f"· exit={a.exit_style} · trend_min_er={a.trend_min_er}")
+          f"· exit={a.exit_style} · trend_align={a.trend_align} · trend_min_er={a.trend_min_er}")
     print("-" * 78)
     print(f"{'asset':10} {'trades':>7} {'win%':>6} {'exp(R)':>8} {'totR':>8} {'PF':>6} {'maxDD(R)':>9}")
     agg_r: list[float] = []
