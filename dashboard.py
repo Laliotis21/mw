@@ -630,6 +630,25 @@ with st.expander("⚙ Desk controls"):
             _toast_closed(closed)
             st.success(f"Settled {len(closed)} closed position(s)." if closed else "No positions resolved yet.")
             st.rerun()
+        # Manual close: pick an open broker position and flatten it at market.
+        opens = [t for t in _load_log()["trades"]
+                 if t.get("result") == "open" and t.get("alpaca_order_id")]
+        if opens:
+            labels = {
+                f"{t['asset']} {t['action']} x{t['quantity']} @ ${t['entry_price']} "
+                f"[{(t.get('alpaca_order_id') or '')[:8]}]": t["alpaca_order_id"]
+                for t in opens
+            }
+            pick = st.selectbox("Open position to close", list(labels.keys()),
+                                label_visibility="collapsed")
+            if st.button("✖ Close selected position now (market)"):
+                from execution import close_open
+                res = close_open(labels[pick])
+                if res:
+                    st.success(f"Closed {res['asset']} — {res['result']} · P&L ${res['pnl']:+,.2f}")
+                    st.rerun()
+                else:
+                    st.error("Close failed — check the venue/logs.")
     if st.button("Flatten book — clear all trades & reset balance"):
         if TRADE_LOG.exists():
             TRADE_LOG.unlink()

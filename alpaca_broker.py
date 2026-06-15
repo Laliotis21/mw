@@ -113,6 +113,41 @@ def place_bracket(ticket: ExecutionTicket) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Manual close — flatten a position now (cancel bracket, market-close fills).
+# --------------------------------------------------------------------------- #
+def close_position(record: dict) -> Optional[Tuple[str, float, float]]:
+    """
+    Close an open bracket on demand. Cancels the resting bracket, and if the
+    entry actually filled, market-closes the position. Returns
+    (result, exit_price, pnl): 'manual_close' with realized P&L if a position
+    was flattened, or 'canceled' (pnl 0) if the entry never filled. None on error.
+    """
+    oid = record.get("alpaca_order_id")
+    symbol = record.get("asset")
+    if not oid or not symbol:
+        return None
+    try:
+        # 1) Cancel the resting bracket (parent cancels its TP/SL children).
+        requests.delete(_url(f"/v2/orders/{oid}"), headers=_headers(), timeout=REQUEST_TIMEOUT)
+        # 2) Is there a filled position to flatten?
+        pr = requests.get(_url(f"/v2/positions/{symbol}"), headers=_headers(), timeout=REQUEST_TIMEOUT)
+        if pr.status_code != 200:
+            return ("canceled", 0.0, 0.0)  # entry never filled — nothing to close
+        pos = pr.json()
+        entry = float(record["entry_price"])
+        qty = abs(int(float(pos.get("qty") or record["quantity"])))
+        cur = float(pos.get("current_price") or entry)
+        is_long = record.get("action") == "BUY"
+        # Market-close the whole position.
+        requests.delete(_url(f"/v2/positions/{symbol}"), headers=_headers(), timeout=REQUEST_TIMEOUT)
+        pnl = round((cur - entry) * qty if is_long else (entry - cur) * qty, 2)
+        return ("manual_close", round(cur, 2), pnl)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Alpaca close_position failed for %s: %s", symbol, exc)
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Reconcile an open bracket.
 # --------------------------------------------------------------------------- #
 def reconcile_bracket(record: dict) -> Optional[Tuple[str, float, float]]:
