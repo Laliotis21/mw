@@ -42,29 +42,37 @@ REWARD_RISK = 2.0
 # Indicators
 # --------------------------------------------------------------------------- #
 def _indicators(asset: str) -> Optional[dict]:
-    """Compute the technical snapshot from real daily candles; None if no data."""
+    """
+    Technical snapshot from real daily candles; None if there's too little data
+    even for momentum. Works on as few as 6 bars (fresh IPOs) — trend rules need
+    >=25 bars (`bars` is exposed so the caller can gate on it), but the momentum
+    + catalyst path runs on thin history too.
+    """
     import yfinance as yf
 
     df = yf.Ticker(asset).history(period="3mo", interval="1d")
-    if df is None or df.empty or len(df) < 25:
+    if df is None or df.empty or len(df) < 6:
         return None
     close, high, low = df["Close"], df["High"], df["Low"]
+    bars = len(close)
     last = float(close.iloc[-1])
-    sma20 = float(close.tail(20).mean())
-    sma50 = float(close.tail(min(50, len(close))).mean())
-    atr = float((high - low).tail(14).mean())
-    hi20 = float(high.tail(20).max())
-    lo20 = float(low.tail(20).min())
-    delta = close.diff()
-    gain = float(delta.clip(lower=0).tail(14).mean())
-    loss = float((-delta.clip(upper=0)).tail(14).mean())
-    rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
-    mom = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
-    # Floor the stop distance so a quiet tape can't produce a zero-risk stop.
+    sma20 = float(close.tail(min(20, bars)).mean())
+    sma50 = float(close.tail(min(50, bars)).mean())
+    atr = float((high - low).tail(min(14, bars)).mean())
+    hi20 = float(high.tail(min(20, bars)).max())
+    lo20 = float(low.tail(min(20, bars)).min())
+    if bars >= 15:
+        delta = close.diff()
+        gain = float(delta.clip(lower=0).tail(14).mean())
+        loss = float((-delta.clip(upper=0)).tail(14).mean())
+        rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+    else:
+        rsi = 50.0  # neutral until there's enough history
+    mom = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
     stop_dist = max(ATR_STOP_MULT * atr, last * 0.005)
     return {
         "last": last, "sma20": sma20, "sma50": sma50, "atr": atr, "rsi": rsi,
-        "hi20": hi20, "lo20": lo20, "mom": mom, "stop_dist": stop_dist,
+        "hi20": hi20, "lo20": lo20, "mom": mom, "stop_dist": stop_dist, "bars": bars,
     }
 
 

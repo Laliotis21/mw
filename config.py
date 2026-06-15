@@ -85,6 +85,10 @@ class Settings:
         # Decision engine: 'rules' (deterministic candle strategy, free, no LLM)
         # or 'llm' (CrewAI/Claude desk — worth it once live news feeds in).
         self.DECISION_ENGINE: str = os.getenv("DECISION_ENGINE", "rules").lower()
+        # News/catalyst layer (free, via Alpaca News). USE_NEWS gates it on/off;
+        # NEWS_SENTIMENT = 'keyword' (free) or 'llm' (1 cheap Haiku call/ticker).
+        self.USE_NEWS: bool = os.getenv("USE_NEWS", "true").lower() == "true"
+        self.NEWS_SENTIMENT: str = os.getenv("NEWS_SENTIMENT", "keyword").lower()
         self.LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").lower()
         self.RESEARCH_SOURCE: str = os.getenv("RESEARCH_SOURCE", "perplexity").lower()
         # FILL_SOURCE: how paper fills resolve.
