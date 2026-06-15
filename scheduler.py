@@ -120,9 +120,11 @@ def main() -> None:
     day_open_equity = current_equity()
     cycle = 0
     while True:
-        if date.today() != day:  # new trading day → reset the loss baseline
-            day, day_open_equity = date.today(), current_equity()
-            logger.info("AUTORUN: new day, equity baseline $%.2f", day_open_equity)
+        if date.today() != day:  # new trading day → report + reset the loss baseline
+            eq = current_equity()
+            logger.info("AUTORUN DAILY REPORT %s | P&L $%.2f | equity $%.2f",
+                        day, eq - day_open_equity, eq)
+            day, day_open_equity = date.today(), eq
         cycle += 1
         try:
             run_once(day_open_equity, cycle)
