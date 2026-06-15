@@ -82,6 +82,9 @@ class Settings:
         # Provider switches — let us test agents for free, no paid keys.
         #   LLM_PROVIDER:    'anthropic' (Claude) | 'ollama' (local, free)
         #   RESEARCH_SOURCE: 'perplexity' (paid) | 'mock' (free, canned data)
+        # Decision engine: 'rules' (deterministic candle strategy, free, no LLM)
+        # or 'llm' (CrewAI/Claude desk — worth it once live news feeds in).
+        self.DECISION_ENGINE: str = os.getenv("DECISION_ENGINE", "rules").lower()
         self.LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").lower()
         self.RESEARCH_SOURCE: str = os.getenv("RESEARCH_SOURCE", "perplexity").lower()
         # FILL_SOURCE: how paper fills resolve.

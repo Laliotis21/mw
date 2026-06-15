@@ -115,6 +115,11 @@ def run_cycle(
     global _LAST_USAGE
     _LAST_USAGE = {}  # clear up front so a kickoff failure can't leak prior usage
 
+    # Deterministic engine: no LLM, no tokens. The crew path below is LLM-only.
+    if settings.DECISION_ENGINE == "rules":
+        from strategy import rules_ticket
+        return rules_ticket(asset, market_phase)
+
     researcher = build_researcher()
     analyst = build_analyst()
 
@@ -235,6 +240,11 @@ def run_discovery(
 
     global _LAST_USAGE
     _LAST_USAGE = {}  # clear up front so a kickoff failure can't leak prior usage
+
+    # Deterministic engine: scan + rank movers with no LLM ranker.
+    if settings.DECISION_ENGINE == "rules":
+        from strategy import rules_discovery
+        return rules_discovery(market_phase)
 
     world_scout = build_world_scout()
     stock_scanner = build_stock_scanner()

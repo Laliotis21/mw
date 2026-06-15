@@ -154,6 +154,10 @@ def topbar_html(live: bool) -> str:
         else '<span class="chip paper">PAPER</span>'
     )
     clock = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    engine_chip = (
+        "ENGINE RULES" if settings.DECISION_ENGINE == "rules"
+        else f"LLM {settings.LLM_PROVIDER.upper()}"
+    )
     dot = "livedot" if live else "livedot off"
     feed_chip = (
         f'<span class="chip feed"><span class="{dot}"></span>LIVE</span>' if live
@@ -166,7 +170,7 @@ def topbar_html(live: bool) -> str:
       <div class="chips">
         {feed_chip}
         {mode_chip}
-        <span class="chip">LLM {settings.LLM_PROVIDER.upper()}</span>
+        <span class="chip">{engine_chip}</span>
         <span class="chip">FILL {fill.upper()}</span>
         <span class="chip">{clock}</span>
       </div>
@@ -453,18 +457,25 @@ with right:
 # Fragments pick up the new fills on their next tick (no manual refresh).
 # --------------------------------------------------------------------------- #
 if run and (discover or asset):
-    # LLM provider/model come from .env (anthropic + Haiku, or ollama). Research
-    # stays free/local and fills stay paper so no extra keys are needed.
+    # LLM + fill source come from .env. Research stays free/local (candles) so no
+    # Perplexity key is needed; FILL_SOURCE decides sim (yfinance) vs real broker
+    # paper orders (alpaca / binance / live).
     settings.RESEARCH_SOURCE = "candles"
-    settings.FILL_SOURCE = "yfinance"
 
-    if settings.LLM_PROVIDER == "anthropic" and not settings.ANTHROPIC_API_KEY:
-        st.error("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is empty. "
-                 "Add your key to .env (ANTHROPIC_API_KEY=sk-ant-…) and rerun.")
+    if (settings.DECISION_ENGINE == "llm" and settings.LLM_PROVIDER == "anthropic"
+            and not settings.ANTHROPIC_API_KEY):
+        st.error("DECISION_ENGINE=llm + provider anthropic but ANTHROPIC_API_KEY is empty. "
+                 "Add your key to .env or set DECISION_ENGINE=rules.")
         st.stop()
 
-    from execution import execute_ticket, log_usage, set_last_run
+    from execution import execute_ticket, log_usage, reconcile_open, set_last_run
     from main import pop_last_usage, run_cycle, run_discovery
+
+    # Settle any broker brackets that closed since last run before placing new ones.
+    if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
+        n = reconcile_open()
+        if n:
+            right.info(f"Reconciled {n} closed broker position(s).")
 
     results = right.container()
     cost0 = _load_log()["meta"].get("usage", {}).get("cost_usd", 0.0)
@@ -538,7 +549,13 @@ elif run and not discover and not asset:
 # Reset, tucked at the bottom.
 # --------------------------------------------------------------------------- #
 with st.expander("⚙ Desk controls"):
-    st.caption(f"Risk cap ${settings.MAX_RISK_DOLLARS:,.0f}/trade · daily stop {settings.DAILY_MAX_LOSS_PCT*100:.0f}% · starting capital ${settings.STARTING_CAPITAL:,.0f}")
+    st.caption(f"Risk cap ${settings.MAX_RISK_DOLLARS:,.0f}/trade · daily stop {settings.DAILY_MAX_LOSS_PCT*100:.0f}% · starting capital ${settings.STARTING_CAPITAL:,.0f} · fills via {settings.FILL_SOURCE.upper()}")
+    if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
+        if st.button("🔄 Reconcile open positions (poll broker, settle TP/SL)"):
+            from execution import reconcile_open
+            n = reconcile_open()
+            st.success(f"Settled {n} closed position(s)." if n else "No positions resolved yet.")
+            st.rerun()
     if st.button("Flatten book — clear all trades & reset balance"):
         if TRADE_LOG.exists():
             TRADE_LOG.unlink()
