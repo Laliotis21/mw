@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 
-from strategy import ATR_STOP_MULT, REWARD_RISK, simulate_exit
+from strategy import ATR_STOP_MULT, REWARD_RISK, efficiency_ratio, simulate_exit
 
 
 def _is_crypto(a: str) -> bool:
@@ -27,7 +27,8 @@ def _is_crypto(a: str) -> bool:
 
 
 def backtest_asset(asset: str, days: int = 365, max_hold: int = 20,
-                   exit_style: str = "target") -> dict:
+                   exit_style: str = "target", trend_min_er: float = 0.0,
+                   er_window: int = 20, trend_align: bool = False) -> dict:
     """Return per-asset stats: trades, win%, expectancy (R), avg R, profit factor."""
     import numpy as np
     import yfinance as yf
@@ -77,6 +78,15 @@ def backtest_asset(asset: str, days: int = 365, max_hold: int = 20,
                 and vol_ok and not crypto)  # crypto long-only
 
         action = "BUY" if (buy and not sell) else ("SELL" if (sell and not buy) else None)
+        # Trend-quality gate: skip choppy regimes (low Efficiency Ratio).
+        if action and trend_min_er > 0 and efficiency_ratio(close[:i + 1], er_window) < trend_min_er:
+            action = None
+        # Trend-alignment gate: don't fight the primary trend (SMA50 slope).
+        if action and trend_align and i >= 60:
+            sma50_prev = close[i - 60:i - 10].mean()
+            rising = sma50 > sma50_prev
+            if (action == "BUY" and not rising) or (action == "SELL" and rising):
+                action = None
         if action is None:
             i += 1
             continue
@@ -125,17 +135,23 @@ def main() -> int:
     p.add_argument("--max-hold", type=int, default=20, help="Max bars to hold a trade.")
     p.add_argument("--exit-style", choices=["target", "be_partial"], default="target",
                    help="target = fixed 2R; be_partial = half off at 1R + breakeven stop.")
+    p.add_argument("--trend-min-er", type=float, default=0.0,
+                   help="Min Kaufman Efficiency Ratio to take a trade (0 = filter off).")
+    p.add_argument("--er-window", type=int, default=20, help="Efficiency Ratio window (bars).")
+    p.add_argument("--trend-align", action="store_true",
+                   help="Only trade in the direction of the SMA50 slope.")
     a = p.parse_args()
     assets = a.asset or ["AAPL", "MSFT", "NVDA", "SPY", "BTC-USD", "ETH-USD"]
 
     print(f"\nBACKTEST · technical-only (no news) · {a.days}d · max-hold {a.max_hold} bars "
-          f"· exit={a.exit_style}")
+          f"· exit={a.exit_style} · trend_min_er={a.trend_min_er}")
     print("-" * 78)
     print(f"{'asset':10} {'trades':>7} {'win%':>6} {'exp(R)':>8} {'totR':>8} {'PF':>6} {'maxDD(R)':>9}")
     agg_r: list[float] = []
     tot_trades = 0
     for asset in assets:
-        s = backtest_asset(asset, a.days, a.max_hold, a.exit_style)
+        s = backtest_asset(asset, a.days, a.max_hold, a.exit_style,
+                           a.trend_min_er, a.er_window, a.trend_align)
         if s["trades"] == 0:
             print(f"{asset:10} {'—':>7}  {s.get('note','')}")
             continue

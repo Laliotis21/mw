@@ -99,6 +99,11 @@ Routing: `binance` → crypto only · `alpaca` → stocks only · `live` → bot
 - **Exit style** (`EXIT_STYLE`): `be_partial` (default) banks half at +1R and
   trails the stop to breakeven; `target` is the fixed 2R exit. Shared by the
   paper fill and `backtest.py` (`strategy.simulate_exit`) so both measure the same logic.
+- **Trend-alignment filter** (`TREND_FILTER`, default on): longs only when the
+  SMA50 is rising, shorts only when it's falling — no counter-trend trades.
+  Backtest: +30% total R and the worst bleeder (NVDA) cut from −6.5R to −2.0R.
+  Optional chop gate via `TREND_MIN_ER` (Kaufman Efficiency Ratio) is off by
+  default — it backtests worse on a trending basket.
 - **Geometry invariant**: BUY needs `stop < entry < target`; SELL the reverse.
 - **No leverage**: `cap_quantity` clamps notional ≤ capital.
 - **Daily circuit breaker**: bot stands down if day drawdown ≥

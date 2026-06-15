@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from config import (
@@ -139,6 +140,21 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> float:
     return float(100 - 100 / (1 + rs))
 
 
+def efficiency_ratio(values, period: int = 20) -> float:
+    """Kaufman Efficiency Ratio over the last `period` bars: net directional move
+    divided by the total path travelled. 1.0 = a perfectly clean trend, ~0 = pure
+    chop. Used to gate out directionless, whipsaw-prone names. Accepts any
+    sequence (list / np.ndarray / pd.Series); returns 0.0 on thin history.
+    """
+    arr = np.asarray(values, dtype=float)
+    if len(arr) < period + 1:
+        return 0.0
+    seg = arr[-(period + 1):]
+    net = abs(seg[-1] - seg[0])
+    noise = float(np.abs(np.diff(seg)).sum())
+    return float(net / noise) if noise > 0 else 0.0
+
+
 def _true_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
     """Average True Range (latest), the real definition that accounts for gaps.
 
@@ -183,10 +199,14 @@ def _indicators(asset: str) -> Optional[dict]:
     vol = df["Volume"]
     avg_vol = float(vol.tail(min(20, bars)).mean())
     vol_ok = avg_vol <= 0 or float(vol.iloc[-1]) >= 0.7 * avg_vol  # participation
+    er = efficiency_ratio(close, period=min(settings.TREND_ER_WINDOW, bars - 1))
+    # SMA50 slope for trend alignment: compare the current SMA50 to where it sat
+    # ~10 bars ago. None on thin history (we don't gate what we can't measure).
+    sma50_rising = float(close.iloc[-60:-10].mean()) < sma50 if bars >= 60 else None
     return {
         "last": last, "sma20": sma20, "sma50": sma50, "atr": atr, "rsi": rsi,
         "hi20": hi20, "lo20": lo20, "mom": mom, "stop_dist": stop_dist,
-        "bars": bars, "vol_ok": vol_ok,
+        "bars": bars, "vol_ok": vol_ok, "er": er, "sma50_rising": sma50_rising,
     }
 
 
@@ -267,6 +287,33 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     extended = last > sma20 * 1.08
     buy = ((up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)) and vol_ok and not extended
     sell = ((down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)) and vol_ok
+
+    # Trend-alignment gate (default): don't fight the primary trend. Drop a long
+    # when the SMA50 is falling and a short when it's rising — that's where the
+    # strategy gets run over (counter-trend whipsaws). A live catalyst already
+    # passed above, so news plays aren't gated. None slope = thin history, skip.
+    rising = ind.get("sma50_rising")
+    if settings.TREND_FILTER and rising is not None:
+        if buy and not rising:
+            return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.25,
+                               rationale=(f"HOLD: BUY against a falling SMA50 (counter-trend) "
+                                          f"— stand down. close {last:.2f}, SMA50 {sma50:.2f}."),
+                               time_horizon="swing")
+        if sell and rising:
+            return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.25,
+                               rationale=(f"HOLD: SELL against a rising SMA50 (counter-trend) "
+                                          f"— stand down. close {last:.2f}, SMA50 {sma50:.2f}."),
+                               time_horizon="swing")
+
+    # Optional chop gate (opt-in via TREND_MIN_ER>0): refuse trades in choppy,
+    # directionless price (low Efficiency Ratio). Off by default — backtests show
+    # it removes profitable moderate-trend trades on a trending basket.
+    er = ind.get("er", 1.0)
+    if settings.TREND_MIN_ER > 0 and (buy or sell) and er < settings.TREND_MIN_ER:
+        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.25,
+                           rationale=(f"HOLD: choppy regime (ER {er:.2f} < {settings.TREND_MIN_ER:.2f}) "
+                                      f"— no clean trend to trade. close {last:.2f}, RSI {rsi:.0f}."),
+                           time_horizon="swing")
 
     if crypto and sell and not buy:  # spot crypto is long-only — never short
         return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
