@@ -406,9 +406,15 @@ with right:
 # Fragments pick up the new fills on their next tick (no manual refresh).
 # --------------------------------------------------------------------------- #
 if run and (discover or asset):
-    settings.LLM_PROVIDER = "ollama"
+    # LLM provider/model come from .env (anthropic + Haiku, or ollama). Research
+    # stays free/local and fills stay paper so no extra keys are needed.
     settings.RESEARCH_SOURCE = "candles"
     settings.FILL_SOURCE = "yfinance"
+
+    if settings.LLM_PROVIDER == "anthropic" and not settings.ANTHROPIC_API_KEY:
+        st.error("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is empty. "
+                 "Add your key to .env (ANTHROPIC_API_KEY=sk-ant-…) and rerun.")
+        st.stop()
 
     from execution import execute_ticket, log_usage
     from main import pop_last_usage, run_cycle, run_discovery
