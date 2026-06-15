@@ -339,15 +339,69 @@ def _fmt_time(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _live_prices(symbols: list[str]) -> dict:
+    """Latest price per symbol via yfinance fast_info. Missing on any failure."""
+    out: dict[str, float] = {}
+    try:
+        import yfinance as yf
+        for s in set(symbols):
+            try:
+                fi = yf.Ticker(s).fast_info
+                p = fi.get("lastPrice") or fi.get("last_price")
+                if p:
+                    out[s] = float(p)
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def render_open_positions(df: pd.DataFrame) -> None:
     if df.empty or "result" not in df or not (df["result"] == "open").any():
         return
-    st.markdown('<div class="phead"><span class="acc">▎</span>OPEN POSITIONS</div>', unsafe_allow_html=True)
-    op = _fmt_time(df[df["result"] == "open"]).rename(columns={
-        "asset": "Ticker", "action": "Side", "entry_price": "Entry", "stop_loss": "Stop",
-        "take_profit": "Target", "quantity": "Qty", "fill_source": "Venue"})
-    cols = [c for c in ["Time", "Ticker", "Side", "Qty", "Entry", "Stop", "Target", "Venue"] if c in op]
-    st.dataframe(op[cols].iloc[::-1], width="stretch", hide_index=True)
+    st.markdown('<div class="phead"><span class="acc">▎</span>OPEN POSITIONS · live</div>', unsafe_allow_html=True)
+    op = _fmt_time(df[df["result"] == "open"]).copy()
+    prices = _live_prices(op["asset"].tolist())
+
+    def _live(r):
+        return prices.get(r["asset"])
+
+    def _unreal(r):
+        live = prices.get(r["asset"])
+        if live is None:
+            return None
+        edge = (live - r["entry_price"]) if r["action"] == "BUY" else (r["entry_price"] - live)
+        return round(edge * r["quantity"], 2)
+
+    def _to(r, level):  # % from live price to a stop/target level
+        live = prices.get(r["asset"])
+        return round((level - live) / live * 100, 1) if live else None
+
+    op["Live"] = op.apply(_live, axis=1)
+    op["Unreal $"] = op.apply(_unreal, axis=1)
+    op["→Stop%"] = op.apply(lambda r: _to(r, r["stop_loss"]), axis=1)
+    op["→Tgt%"] = op.apply(lambda r: _to(r, r["take_profit"]), axis=1)
+    op = op.rename(columns={"asset": "Ticker", "action": "Side", "entry_price": "Entry",
+                            "stop_loss": "Stop", "take_profit": "Target", "quantity": "Qty",
+                            "fill_source": "Venue"})
+    cols = [c for c in ["Time", "Ticker", "Side", "Qty", "Entry", "Live", "Unreal $",
+                        "Stop", "→Stop%", "Target", "→Tgt%", "Venue"] if c in op]
+    view = op[cols].iloc[::-1]
+
+    def _pcolor(v):
+        if pd.isna(v):
+            return ""
+        return f"color:{GREEN}" if v > 0 else (f"color:{RED}" if v < 0 else f"color:{MUTED}")
+
+    styler = view.style.map(_pcolor, subset=["Unreal $"]) if "Unreal $" in view else view.style
+    fmts = {c: "${:,.2f}" for c in ("Entry", "Live", "Stop", "Target") if c in view}
+    if "Unreal $" in view:
+        fmts["Unreal $"] = "${:+,.2f}"
+    for c in ("→Stop%", "→Tgt%"):
+        if c in view:
+            fmts[c] = "{:+.1f}%"
+    st.dataframe(styler.format(fmts, na_rep="—"), width="stretch", hide_index=True)
 
 
 def render_blotter(df: pd.DataFrame) -> None:
