@@ -76,10 +76,14 @@ def cost_usd(
             )
         return 0.0
     in_rate, out_rate = price
-    cached = max(0, min(cached_tokens, prompt_tokens))
-    uncached = prompt_tokens - cached
+    # CrewAI reports `prompt_tokens` (Anthropic input_tokens = UNCACHED input)
+    # and `cached_tokens` (cache_read_input_tokens) as DISJOINT counts — cached
+    # is NOT a subset of prompt_tokens. Bill uncached at full rate, cache reads
+    # at 0.1x, and add them. (Cache-write 1.25x premium isn't surfaced
+    # separately by CrewAI, so it rides in prompt_tokens at ~full rate.)
+    cached = max(0, cached_tokens)
     cost = (
-        uncached * in_rate
+        prompt_tokens * in_rate
         + cached * in_rate * CACHED_READ_FACTOR
         + completion_tokens * out_rate
     ) / 1_000_000

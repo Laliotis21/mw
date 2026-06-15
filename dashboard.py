@@ -206,7 +206,9 @@ def ledger_html(meta: dict) -> str:
                 'margin:-.4rem 0 .8rem">API SPEND  —  no LLM calls logged yet '
                 '(free local model = $0; switch LLM_PROVIDER=anthropic for real $).</div>')
     spend = u.get("cost_usd", 0.0)
-    toks = u.get("total_tokens") or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
+    pt, ct, cached = u.get("prompt_tokens", 0), u.get("completion_tokens", 0), u.get("cached_tokens", 0)
+    toks = pt + cached + ct
+    cache_pct = (cached / (pt + cached) * 100) if (pt + cached) else 0.0
     reqs = u.get("requests", 0)
     model = (u.get("model") or "").split("/")[-1]
     paid = spend > 0
@@ -214,6 +216,7 @@ def ledger_html(meta: dict) -> str:
     cells = [
         ("API SPEND", spend_txt),
         ("TOKENS", f"{toks:,}"),
+        ("CACHED", f"{cache_pct:.0f}%"),
         ("LLM CALLS", f"{reqs:,}"),
         ("MODEL", model or "—"),
     ]
