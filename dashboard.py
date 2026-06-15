@@ -382,31 +382,13 @@ def _fmt_time(df: pd.DataFrame) -> pd.DataFrame:
 
 def _live_prices(symbols: list[str]) -> dict:
     """
-    Latest price per symbol via yfinance, cached ~10s in session_state. Without
-    the cache the auto-refresh fragment fetches every 2-3s tick → the whole app
-    sits under Streamlit's 'running' dim almost constantly. Caching makes most
-    ticks instant.
+    Instant read from the background price poller (prices.py). The poller keeps
+    a fast batched price map fresh (~2s) off the render thread, so this never
+    does network I/O — the fragment renders immediately, no dim, prices live.
     """
-    import time as _t
-    want = set(symbols)
-    cache = st.session_state.get("_px_cache", {"ts": 0.0, "data": {}})
-    if _t.time() - cache["ts"] < 10 and want <= set(cache["data"]):
-        return cache["data"]
-    out: dict[str, float] = {}
-    try:
-        import yfinance as yf
-        for s in want:
-            try:
-                fi = yf.Ticker(s).fast_info
-                p = fi.get("lastPrice") or fi.get("last_price")
-                if p:
-                    out[s] = float(p)
-            except Exception:  # noqa: BLE001
-                continue
-    except Exception:  # noqa: BLE001
-        pass
-    st.session_state["_px_cache"] = {"ts": _t.time(), "data": out}
-    return out
+    import prices
+    prices.watch(symbols)
+    return prices.get_all()
 
 
 def render_open_positions(df: pd.DataFrame) -> None:
