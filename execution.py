@@ -311,6 +311,42 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
 # --------------------------------------------------------------------------- #
 # Public entry point.
 # --------------------------------------------------------------------------- #
+def _today_trade_count(log: dict) -> int:
+    today = datetime.now(timezone.utc).date().isoformat()
+    return sum(1 for t in log["trades"]
+               if t.get("result") not in ("no_trade", "blocked", None)
+               and (t.get("timestamp_utc") or "").startswith(today))
+
+
+def _portfolio_block(ticket: ExecutionTicket, log: dict) -> Optional[str]:
+    """Reason to refuse a BUY/SELL (dedup, max open, portfolio risk, daily cap), or None."""
+    if ticket.action == Action.HOLD or ticket.quantity == 0:
+        return None
+    opens = [t for t in log["trades"] if t.get("result") == "open"]
+    if any(t["asset"] == ticket.asset for t in opens):
+        return f"already holding {ticket.asset}"
+    if len(opens) >= settings.MAX_OPEN_POSITIONS:
+        return f"max {settings.MAX_OPEN_POSITIONS} open positions"
+    cap = log["meta"]["equity"]
+    open_risk = sum(float(t.get("risk_dollars", 0) or 0) for t in opens)
+    if open_risk + ticket.risk_dollars > settings.MAX_PORTFOLIO_RISK_PCT * cap + 0.01:
+        return f"portfolio risk > {settings.MAX_PORTFOLIO_RISK_PCT*100:.0f}% cap"
+    if _today_trade_count(log) >= settings.MAX_TRADES_PER_DAY:
+        return f"max {settings.MAX_TRADES_PER_DAY} trades/day"
+    return None
+
+
+def _sim_costs(fill: dict, ticket: ExecutionTicket) -> float:
+    """Slippage + fees for SIM fills only (broker fills already include them)."""
+    if fill.get("fill_source") not in ("yfinance", "coinflip"):
+        return 0.0
+    if fill["result"] not in ("take_profit", "stop_loss", "markout"):
+        return 0.0
+    notional = abs(fill.get("entry_price", ticket.entry_price)) * fill.get("quantity", ticket.quantity)
+    # Slippage on entry + exit, fee on entry + exit.
+    return round(notional * (2 * settings.SLIPPAGE_BPS + 2 * settings.FEE_BPS) / 10_000, 2)
+
+
 def execute_ticket(
     ticket: ExecutionTicket,
     outcome: Optional[str] = None,
@@ -329,7 +365,27 @@ def execute_ticket(
     log = _load_log()
     equity_before = log["meta"]["equity"]
 
+    # Portfolio guard: dedup, max open, total risk, daily trade cap.
+    block = _portfolio_block(ticket, log)
+    if block:
+        logger.info("BLOCKED %s %s — %s", ticket.action.value, ticket.asset, block)
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "asset": ticket.asset, "action": ticket.action.value,
+            "quantity": 0, "entry_price": ticket.entry_price, "result": "blocked",
+            "pnl": 0.0, "block_reason": block, "equity_before": equity_before,
+            "equity_after": equity_before, "rationale": ticket.rationale,
+            "llm_cost_usd": round(_bump_meta_usage(log, usage), 6),
+            "llm_tokens": (usage or {}).get("total_tokens", 0),
+        }
+        log["trades"].append(record)
+        _save_log(log)
+        return record
+
     fill = simulate_fill(ticket, outcome=outcome, market_phase=market_phase)
+    costs = _sim_costs(fill, ticket)
+    if costs:
+        fill["pnl"] = round(fill["pnl"] - costs, 2)
     equity_after = round(equity_before + fill["pnl"], 2)
 
     # Attribute this cycle's LLM token cost to the trade + the run ledger.
@@ -362,6 +418,7 @@ def execute_ticket(
         # LLM cost to produce this ticket (0.0 for free local models).
         "llm_cost_usd": round(cycle_cost, 6),
         "llm_tokens": (usage or {}).get("total_tokens", 0),
+        "costs": costs,  # slippage + fees applied (sim fills)
     }
 
     log["trades"].append(record)
@@ -428,7 +485,7 @@ def performance_summary() -> dict:
     """Aggregate stats over the whole log: win rate, P&L, max drawdown."""
     log = _load_log()
     # 'open' = Binance bracket not yet resolved; not a settled trade yet.
-    trades = [t for t in log["trades"] if t["result"] not in ("no_trade", "open")]
+    trades = [t for t in log["trades"] if t["result"] not in ("no_trade", "open", "blocked")]
     start = log["meta"]["starting_capital"]
     equity = log["meta"]["equity"]
 

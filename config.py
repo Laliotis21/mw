@@ -93,6 +93,14 @@ class Settings:
         self.AUTORUN_INTERVAL_MIN: int = int(os.getenv("AUTORUN_INTERVAL_MIN", "30"))
         # Background live-price poller refresh (seconds) for OPEN POSITIONS.
         self.PRICE_POLL_SEC: int = int(os.getenv("PRICE_POLL_SEC", "2"))
+
+        # Portfolio risk controls.
+        self.MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+        self.MAX_PORTFOLIO_RISK_PCT: float = float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0.10"))
+        self.MAX_TRADES_PER_DAY: int = int(os.getenv("MAX_TRADES_PER_DAY", "20"))
+        # Execution realism for SIM fills (real broker fills already include these).
+        self.SLIPPAGE_BPS: float = float(os.getenv("SLIPPAGE_BPS", "5"))   # 5 bps = 0.05%
+        self.FEE_BPS: float = float(os.getenv("FEE_BPS", "2"))             # per-side, on notional
         self.LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").lower()
         self.RESEARCH_SOURCE: str = os.getenv("RESEARCH_SOURCE", "perplexity").lower()
         # FILL_SOURCE: how paper fills resolve.

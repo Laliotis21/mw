@@ -214,7 +214,16 @@ def rules_ticket(asset: str, market_phase: str) -> Optional[ExecutionTicket]:
     if per_unit <= 0:
         logger.warning("RULES %s: zero stop distance — HOLD.", asset)
         return rules_ticket_hold(asset, capital)
-    qty = cap_quantity(settings.MAX_RISK_DOLLARS / per_unit, entry, capital)
+    # Confidence-weighted sizing: scale the risk budget 0.5x–1.0x of the cap by
+    # signal confidence (same hard cap, smaller bets on weak setups).
+    risk_budget = settings.MAX_RISK_DOLLARS * min(1.0, 0.5 + 0.5 * signal.confidence)
+    qty = cap_quantity(risk_budget / per_unit, entry, capital)
+    # Affordability: a stock that can't make 1 whole share within budget can't be
+    # a real Alpaca bracket — HOLD instead of faking a sim fill.
+    crypto = asset.upper().endswith(("-USD", "-USDT", "USDT"))
+    if not crypto and settings.FILL_SOURCE in ("alpaca", "live") and int(qty) < 1:
+        logger.info("RULES %s: 1 share risks > budget on a $%.0f book — HOLD.", asset, capital)
+        return rules_ticket_hold(asset, capital)
     risk_dollars = round(qty * per_unit, 2)
     rr = round(abs(target - entry) / per_unit, 2)
     try:
