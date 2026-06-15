@@ -79,17 +79,63 @@ def _indicators(asset: str) -> Optional[dict]:
 # --------------------------------------------------------------------------- #
 # Signal
 # --------------------------------------------------------------------------- #
-def rules_signal(asset: str, market_phase: str) -> TradeSignal:
-    """Deterministic BUY/SELL/HOLD with entry/stop/target from candle rules."""
-    ind = _indicators(asset)
-    if ind is None:
-        return TradeSignal(
-            asset=asset, action=Action.HOLD, confidence=0.0,
-            rationale="No usable candle data — stand down.", time_horizon="swing",
-        )
+def _news(asset: str) -> dict:
+    """News/catalyst signal, or a neutral stub when the news layer is off."""
+    if not settings.USE_NEWS:
+        return {"score": 0.0, "n": 0, "catalyst": False, "top": "", "fresh_hours": None}
+    from news import news_signal
+    return news_signal(asset)
 
-    last, sma20, sma50, rsi, mom = ind["last"], ind["sma20"], ind["sma50"], ind["rsi"], ind["mom"]
-    hi20, lo20, sd = ind["hi20"], ind["lo20"], ind["stop_dist"]
+
+def _mk(asset, action, entry, stop, sd, conf, why, news) -> TradeSignal:
+    """Assemble a directional TradeSignal, folding the news note into rationale."""
+    target = entry + REWARD_RISK * sd if action == Action.BUY else entry - REWARD_RISK * sd
+    note = ""
+    if news.get("n"):
+        note = f" | news {news['score']:+.2f} ({news['n']}h{'·CATALYST' if news.get('catalyst') else ''}): {news.get('top','')}"
+    return TradeSignal(
+        asset=asset, action=action, confidence=round(min(max(conf, 0.0), 1.0), 2),
+        rationale=why + note, suggested_entry=round(entry, 4),
+        suggested_stop=round(stop, 4), suggested_target=round(target, 4),
+        time_horizon="swing",
+    )
+
+
+def rules_signal(asset: str, market_phase: str) -> TradeSignal:
+    """
+    Deterministic BUY/SELL/HOLD from candle rules, with a news/catalyst layer:
+    news confirms or vetoes a technical trade, and a fresh strong catalyst can
+    trigger a momentum entry on thin history (new listings the SMAs can't see).
+    """
+    ind = _indicators(asset)
+    news = _news(asset)
+    ns, catalyst = news.get("score", 0.0), news.get("catalyst", False)
+
+    if ind is None:
+        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.0,
+                           rationale="No usable candle data — stand down.",
+                           time_horizon="swing")
+
+    last, sma20, sma50, rsi = ind["last"], ind["sma20"], ind["sma50"], ind["rsi"]
+    hi20, lo20, mom, bars = ind["hi20"], ind["lo20"], ind["mom"], ind["bars"]
+    sd = ind["stop_dist"]
+    sd_cat = max(sd, last * 0.02)  # wider stop for volatile catalyst moves
+
+    # Catalyst-momentum: fresh strong news aligned with price — works on any
+    # history depth, so it catches IPOs/news plays before the SMAs are valid.
+    if catalyst and ns >= 0.5 and mom > 0:
+        why = f"BUY (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
+        return _mk(asset, Action.BUY, last, last - sd_cat, sd_cat, 0.6 + 0.3 * ns, why, news)
+    if catalyst and ns <= -0.5 and mom < 0:
+        why = f"SELL (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
+        return _mk(asset, Action.SELL, last, last + sd_cat, sd_cat, 0.6 + 0.3 * abs(ns), why, news)
+
+    # Thin history: trend rules unreliable; without a catalyst we stand down.
+    if bars < 25:
+        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.2,
+                           rationale=(f"HOLD: only {bars} bars (too thin for trend rules) "
+                                      f"and no catalyst. news {ns:+.2f}."),
+                           time_horizon="swing")
 
     up_trend = last > sma20 > sma50
     down_trend = last < sma20 < sma50
@@ -97,38 +143,35 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     breakdown = last <= lo20 * 1.001
     rsi_long_ok = 45.0 <= rsi <= 72.0
     rsi_short_ok = 28.0 <= rsi <= 55.0
-
     buy = (up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)
     sell = (down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)
 
     if buy and not sell:
-        action = Action.BUY
-        entry, stop, target = last, last - sd, last + REWARD_RISK * sd
-        conf = 0.5 + 0.2 * up_trend + 0.15 * breakout + 0.1 * rsi_long_ok + 0.05 * (mom > 0)
-        why = (f"BUY: close {last:.2f} {'>' if up_trend else 'vs'} SMA20 {sma20:.2f} "
-               f"> SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%"
-               f"{', 20-bar breakout' if breakout else ''}.")
-    elif sell and not buy:
-        action = Action.SELL
-        entry, stop, target = last, last + sd, last - REWARD_RISK * sd
-        conf = 0.5 + 0.2 * down_trend + 0.15 * breakdown + 0.1 * rsi_short_ok + 0.05 * (mom < 0)
-        why = (f"SELL: close {last:.2f} {'<' if down_trend else 'vs'} SMA20 {sma20:.2f} "
-               f"< SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%"
-               f"{', 20-bar breakdown' if breakdown else ''}.")
-    else:
-        return TradeSignal(
-            asset=asset, action=Action.HOLD, confidence=0.3,
-            rationale=(f"HOLD: no clean edge (close {last:.2f}, SMA20 {sma20:.2f}, "
-                       f"SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%)."),
-            time_horizon="swing",
-        )
+        if ns <= -0.4:  # bad fresh news on a long — veto
+            return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
+                               rationale=(f"HOLD: technical BUY vetoed by negative news "
+                                          f"{ns:+.2f}: {news.get('top','')}"), time_horizon="swing")
+        conf = 0.5 + 0.2 * up_trend + 0.15 * breakout + 0.1 * rsi_long_ok + 0.1 * max(ns, 0)
+        why = (f"BUY: close {last:.2f} {'>' if up_trend else 'vs'} SMA20 {sma20:.2f} > "
+               f"SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%"
+               f"{', 20-bar breakout' if breakout else ''}")
+        return _mk(asset, Action.BUY, last, last - sd, sd, conf, why, news)
 
-    return TradeSignal(
-        asset=asset, action=action, confidence=round(min(conf, 1.0), 2),
-        rationale=why, suggested_entry=round(entry, 4),
-        suggested_stop=round(stop, 4), suggested_target=round(target, 4),
-        time_horizon="swing",
-    )
+    if sell and not buy:
+        if ns >= 0.4:  # good fresh news against a short — veto
+            return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
+                               rationale=(f"HOLD: technical SELL vetoed by positive news "
+                                          f"{ns:+.2f}: {news.get('top','')}"), time_horizon="swing")
+        conf = 0.5 + 0.2 * down_trend + 0.15 * breakdown + 0.1 * rsi_short_ok + 0.1 * max(-ns, 0)
+        why = (f"SELL: close {last:.2f} {'<' if down_trend else 'vs'} SMA20 {sma20:.2f} < "
+               f"SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%"
+               f"{', 20-bar breakdown' if breakdown else ''}")
+        return _mk(asset, Action.SELL, last, last + sd, sd, conf, why, news)
+
+    return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
+                       rationale=(f"HOLD: no clean edge (close {last:.2f}, SMA20 {sma20:.2f}, "
+                                  f"SMA50 {sma50:.2f}, RSI {rsi:.0f}, mom {mom:+.1f}%, "
+                                  f"news {ns:+.2f})."), time_horizon="swing")
 
 
 # --------------------------------------------------------------------------- #
