@@ -23,6 +23,8 @@ dist/
 
 # Trading runtime data / logs
 trade_log.json
+trade_log.*.tmp
+trade_log.corrupt.*.json
 *.log
 
 # OS / editor

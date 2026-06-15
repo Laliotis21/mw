@@ -15,8 +15,11 @@ contract (config.ExecutionTicket) stays identical, so nothing upstream changes.
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import random
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,6 +28,28 @@ from config import Action, ExecutionTicket, cap_quantity, logger, settings
 from usage import cost_usd
 
 TRADE_LOG = Path(__file__).parent / "trade_log.json"
+
+# Serialize the read-modify-write cycle on the log against other THREADS in this
+# process (e.g. a Streamlit auto-refresh fragment calling reconcile_open while
+# the main thread commits a trade), so two load->mutate->save sequences can't
+# clobber each other's equity update. NOTE: this is intra-process only —
+# scheduler.py and the dashboard run as separate processes, where os.replace in
+# _save_log still guarantees no torn file, but a cross-process lost update is not
+# prevented. The hot path (execute_ticket) deliberately runs its fill UNLOCKED so
+# a slow broker/yfinance call can't freeze every other log operation; the rarer
+# manual-close / reconcile paths still hold the lock across their broker calls
+# (live-only, low contention). Reentrant so a locked helper can call another.
+_LOG_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    """Run `fn` while holding the trade-log lock (atomic read-modify-write)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _LOG_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +81,7 @@ def _bump_meta_usage(log: dict, usage: Optional[dict]) -> float:
     return cost
 
 
+@_locked
 def log_usage(usage: Optional[dict]) -> None:
     """Record token usage not tied to a trade (e.g. the discovery crew)."""
     if not usage:
@@ -91,6 +117,7 @@ def _apply_close(t: dict, log: dict) -> Optional[dict]:
     return {"asset": t["asset"], "result": result, "pnl": pnl}
 
 
+@_locked
 def close_open(order_ref: str) -> Optional[dict]:
     """Manually close one open broker position by its broker order id."""
     log = _load_log()
@@ -104,6 +131,7 @@ def close_open(order_ref: str) -> Optional[dict]:
     return None
 
 
+@_locked
 def close_all_open() -> list[dict]:
     """Close EVERY open broker position now. Returns the list of closed trades."""
     log = _load_log()
@@ -114,6 +142,7 @@ def close_all_open() -> list[dict]:
     return results
 
 
+@_locked
 def set_last_run(summary: dict) -> None:
     """Persist a one-line summary of the most recent run for the dashboard."""
     log = _load_log()
@@ -121,6 +150,7 @@ def set_last_run(summary: dict) -> None:
     _save_log(log)
 
 
+@_locked
 def set_autorun_status(status: dict) -> None:
     """Persist the autonomous scheduler's heartbeat/status for the dashboard."""
     log = _load_log()
@@ -136,7 +166,18 @@ def _load_log() -> dict:
         try:
             return json.loads(TRADE_LOG.read_text())
         except json.JSONDecodeError:
-            logger.warning("trade_log.json corrupt — starting fresh.")
+            # Don't silently discard history. Preserve the corrupt file under a
+            # timestamped name so it can be inspected/recovered, then start fresh.
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = TRADE_LOG.with_name(f"trade_log.corrupt.{ts}.json")
+            try:
+                TRADE_LOG.replace(backup)
+                logger.warning(
+                    "trade_log.json corrupt — preserved as %s, starting fresh.",
+                    backup.name,
+                )
+            except OSError:
+                logger.warning("trade_log.json corrupt — starting fresh.")
     return {
         "meta": {
             "starting_capital": settings.STARTING_CAPITAL,
@@ -148,7 +189,13 @@ def _load_log() -> dict:
 
 
 def _save_log(log: dict) -> None:
-    TRADE_LOG.write_text(json.dumps(log, indent=2))
+    # Atomic write: a crash mid-write must never truncate the live log. Write to
+    # a unique temp file in the same dir, then os.replace() (atomic on
+    # POSIX/Windows). The temp name is keyed on pid+thread so two writers never
+    # share a temp path even if a future caller skips the lock.
+    tmp = TRADE_LOG.with_name(f"trade_log.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(log, indent=2))
+    os.replace(tmp, TRADE_LOG)
 
 
 def current_equity() -> float:
@@ -245,12 +292,10 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
     Position size is recomputed so dollar risk respects the hard cap.
     Returns None if no usable price data (caller falls back to coinflip).
     """
-    import yfinance as yf
-
-    from candles import HOLDOUT_BARS, phase_data
+    from candles import HOLDOUT_BARS, fetch_history, phase_data
 
     period, interval = phase_data(market_phase)
-    df = yf.Ticker(ticket.asset).history(period=period, interval=interval)
+    df = fetch_history(ticket.asset, period, interval)
     if df is None or df.empty or len(df) < HOLDOUT_BARS + 2:
         return None
 
@@ -270,30 +315,22 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
         sl, tp = entry * (1 + risk_pct), entry * (1 - rew_pct)
 
     per_unit_risk = abs(entry - sl)
-    qty = settings.MAX_RISK_DOLLARS / per_unit_risk if per_unit_risk > 0 else 0.0
+    # Compounding: size off 2% of the book AT OPEN (not the frozen starting cap).
+    budget = settings.risk_budget(ticket.capital_at_open)
+    qty = budget / per_unit_risk if per_unit_risk > 0 else 0.0
     qty = cap_quantity(qty, entry, ticket.capital_at_open)  # no leverage: notional <= capital
 
-    # Walk the window forward from the entry bar. On a bar that straddles both,
-    # assume the stop hits first (conservative — never flatter the result).
-    result, exit_price = "markout", float(closes.iloc[-1])
-    for i in range(len(window)):
-        hi, lo = float(highs.iloc[i]), float(lows.iloc[i])
-        if is_long:
-            if lo <= sl:
-                result, exit_price = "stop_loss", sl
-                break
-            if hi >= tp:
-                result, exit_price = "take_profit", tp
-                break
-        else:
-            if hi >= sl:
-                result, exit_price = "stop_loss", sl
-                break
-            if lo <= tp:
-                result, exit_price = "take_profit", tp
-                break
+    # Resolve over the held-out window using the configured exit style (shared
+    # with the backtest). R is in units of initial risk; convert to dollars.
+    from strategy import simulate_exit
 
-    pnl = (exit_price - entry) * qty if is_long else (entry - exit_price) * qty
+    result, realized_r, _ = simulate_exit(
+        highs.tolist(), lows.tolist(), closes.tolist(),
+        entry, sl, tp, is_long, style=settings.EXIT_STYLE,
+    )
+    pnl = realized_r * per_unit_risk * qty
+    # Effective exit price implied by the realized R (for the blotter).
+    exit_price = entry + realized_r * per_unit_risk if is_long else entry - realized_r * per_unit_risk
 
     return {
         "result": result,
@@ -361,69 +398,81 @@ def execute_ticket(
     produced this ticket — its dollar cost is stored on the record and rolled
     into the log's running API-spend total. Returns the trade record (also
     appended to trade_log.json).
+
+    Lock discipline: the portfolio guard (phase 1) and the commit (phase 3) each
+    hold _LOG_LOCK around a quick load->mutate->save, but the fill itself
+    (phase 2) — which can place a real broker bracket / hit yfinance — runs
+    UNLOCKED so a slow API call never freezes other log operations.
     """
-    log = _load_log()
-    equity_before = log["meta"]["equity"]
+    # Phase 1 (locked): portfolio guard BEFORE any order is placed. A blocked
+    # trade must never reach simulate_fill (which could route a real bracket).
+    with _LOG_LOCK:
+        log = _load_log()
+        equity_before = log["meta"]["equity"]
+        block = _portfolio_block(ticket, log)
+        if block:
+            logger.info("BLOCKED %s %s — %s", ticket.action.value, ticket.asset, block)
+            record = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "asset": ticket.asset, "action": ticket.action.value,
+                "quantity": 0, "entry_price": ticket.entry_price, "result": "blocked",
+                "pnl": 0.0, "block_reason": block, "equity_before": equity_before,
+                "equity_after": equity_before, "rationale": ticket.rationale,
+                "llm_cost_usd": round(_bump_meta_usage(log, usage), 6),
+                "llm_tokens": (usage or {}).get("total_tokens", 0),
+            }
+            log["trades"].append(record)
+            _save_log(log)
+            return record
 
-    # Portfolio guard: dedup, max open, total risk, daily trade cap.
-    block = _portfolio_block(ticket, log)
-    if block:
-        logger.info("BLOCKED %s %s — %s", ticket.action.value, ticket.asset, block)
-        record = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "asset": ticket.asset, "action": ticket.action.value,
-            "quantity": 0, "entry_price": ticket.entry_price, "result": "blocked",
-            "pnl": 0.0, "block_reason": block, "equity_before": equity_before,
-            "equity_after": equity_before, "rationale": ticket.rationale,
-            "llm_cost_usd": round(_bump_meta_usage(log, usage), 6),
-            "llm_tokens": (usage or {}).get("total_tokens", 0),
-        }
-        log["trades"].append(record)
-        _save_log(log)
-        return record
-
+    # Phase 2 (UNLOCKED): the slow part — simulate/route the fill.
     fill = simulate_fill(ticket, outcome=outcome, market_phase=market_phase)
     costs = _sim_costs(fill, ticket)
     if costs:
         fill["pnl"] = round(fill["pnl"] - costs, 2)
-    equity_after = round(equity_before + fill["pnl"], 2)
 
-    # Attribute this cycle's LLM token cost to the trade + the run ledger.
-    cycle_cost = _bump_meta_usage(log, usage)
+    # Phase 3 (locked): re-read equity (it may have moved while we were filling)
+    # and commit the trade atomically.
+    with _LOG_LOCK:
+        log = _load_log()
+        equity_before = log["meta"]["equity"]
+        equity_after = round(equity_before + fill["pnl"], 2)
+        # Attribute this cycle's LLM token cost to the trade + the run ledger.
+        cycle_cost = _bump_meta_usage(log, usage)
 
-    # Prefer real fill values (yfinance re-anchors price/qty) over the ticket's.
-    record = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "asset": ticket.asset,
-        "action": ticket.action.value,
-        "quantity": fill.get("quantity", ticket.quantity),
-        "entry_price": fill.get("entry_price", ticket.entry_price),
-        "stop_loss": fill.get("stop_loss", ticket.stop_loss),
-        "take_profit": fill.get("take_profit", ticket.take_profit),
-        "exit_price": fill.get("exit_price"),
-        # Real-fill paths re-anchor qty to live price, so risk_dollars must come
-        # from the fill too — else logged risk != quantity * stop distance.
-        "risk_dollars": fill.get("risk_dollars", ticket.risk_dollars),
-        "reward_risk_ratio": ticket.reward_risk_ratio,
-        "result": fill["result"],
-        "pnl": fill["pnl"],
-        "fill_source": fill.get("fill_source", "coinflip"),
-        "equity_before": equity_before,
-        "equity_after": equity_after,
-        "rationale": ticket.rationale,
-        # Open-bracket broker refs (present only for live/testnet orders).
-        "binance_symbol": fill.get("binance_symbol"),
-        "binance_order_list_id": fill.get("binance_order_list_id"),
-        "alpaca_order_id": fill.get("alpaca_order_id"),
-        # LLM cost to produce this ticket (0.0 for free local models).
-        "llm_cost_usd": round(cycle_cost, 6),
-        "llm_tokens": (usage or {}).get("total_tokens", 0),
-        "costs": costs,  # slippage + fees applied (sim fills)
-    }
+        # Prefer real fill values (yfinance re-anchors price/qty) over the ticket's.
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "asset": ticket.asset,
+            "action": ticket.action.value,
+            "quantity": fill.get("quantity", ticket.quantity),
+            "entry_price": fill.get("entry_price", ticket.entry_price),
+            "stop_loss": fill.get("stop_loss", ticket.stop_loss),
+            "take_profit": fill.get("take_profit", ticket.take_profit),
+            "exit_price": fill.get("exit_price"),
+            # Real-fill paths re-anchor qty to live price, so risk_dollars must come
+            # from the fill too — else logged risk != quantity * stop distance.
+            "risk_dollars": fill.get("risk_dollars", ticket.risk_dollars),
+            "reward_risk_ratio": ticket.reward_risk_ratio,
+            "result": fill["result"],
+            "pnl": fill["pnl"],
+            "fill_source": fill.get("fill_source", "coinflip"),
+            "equity_before": equity_before,
+            "equity_after": equity_after,
+            "rationale": ticket.rationale,
+            # Open-bracket broker refs (present only for live/testnet orders).
+            "binance_symbol": fill.get("binance_symbol"),
+            "binance_order_list_id": fill.get("binance_order_list_id"),
+            "alpaca_order_id": fill.get("alpaca_order_id"),
+            # LLM cost to produce this ticket (0.0 for free local models).
+            "llm_cost_usd": round(cycle_cost, 6),
+            "llm_tokens": (usage or {}).get("total_tokens", 0),
+            "costs": costs,  # slippage + fees applied (sim fills)
+        }
 
-    log["trades"].append(record)
-    log["meta"]["equity"] = equity_after
-    _save_log(log)
+        log["trades"].append(record)
+        log["meta"]["equity"] = equity_after
+        _save_log(log)
 
     logger.info(
         "EXECUTED %s %s qty=%s -> %s pnl=$%.2f equity=$%.2f",
@@ -442,6 +491,7 @@ def open_positions_count() -> int:
     return sum(1 for t in _load_log()["trades"] if t.get("result") == "open")
 
 
+@_locked
 def reconcile_open() -> list[dict]:
     """
     Resolve any open broker brackets whose OCO has finished. Updates each trade's

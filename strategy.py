@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import pandas as pd
+
 from config import (
     Action,
     AssetClass,
@@ -36,11 +38,124 @@ from config import (
 
 ATR_STOP_MULT = 1.5
 REWARD_RISK = 2.0
+PARTIAL_FRACTION = 0.5  # fraction banked at +1R under the 'be_partial' exit
+
+
+# --------------------------------------------------------------------------- #
+# Exit simulation — shared by the paper fill (execution) and the backtest, so
+# both measure the SAME exit logic. Pure: walks forward bars, returns the
+# realized R-multiple (in units of initial risk) plus a coarse result label.
+# --------------------------------------------------------------------------- #
+def simulate_exit(
+    highs, lows, closes, entry: float, stop: float, target: float,
+    is_long: bool, style: str = "target",
+) -> tuple[str, float, int]:
+    """Walk the forward bars and resolve the trade; return (result, R, exit_idx).
+
+    `highs/lows/closes` are the bars AFTER entry (any sequence). R is the realized
+    profit in units of the initial stop distance (a −1R loss, +2R target win).
+    `exit_idx` is the 0-based index of the bar that closed the trade (len-1 on a
+    markout) so a caller can resume scanning right after it.
+
+    style:
+      'target'     — original behaviour: first of stop / target hits; if a single
+                     bar straddles both, the STOP is assumed first (conservative);
+                     if neither is touched, mark to the last close.
+      'be_partial' — bank PARTIAL_FRACTION at +1R and move the stop to breakeven;
+                     the remainder runs to the 2R target (stop = breakeven).
+                     Same conservative stop-first rule on straddling bars.
+    """
+    risk = abs(entry - stop)
+    n = len(closes)
+    if risk <= 0 or n == 0:
+        return ("markout", 0.0, max(n - 1, 0))
+    last = n - 1
+
+    def r_of(price: float) -> float:  # signed R at a price for this direction
+        return (price - entry) / risk if is_long else (entry - price) / risk
+
+    if style != "be_partial":
+        for i in range(n):
+            hi, lo = float(highs[i]), float(lows[i])
+            hit_stop = lo <= stop if is_long else hi >= stop
+            hit_tp = hi >= target if is_long else lo <= target
+            if hit_stop:
+                return ("stop_loss", -1.0, i)
+            if hit_tp:
+                return ("take_profit", r_of(target), i)
+        return ("markout", r_of(float(closes[last])), last)
+
+    # be_partial: half off at +1R, stop to breakeven, remainder to target.
+    one_r = entry + risk if is_long else entry - risk
+    stop_px, remaining, banked_r, partial_done = stop, 1.0, 0.0, False
+    for i in range(n):
+        hi, lo = float(highs[i]), float(lows[i])
+        # Conservative: the active stop is checked before any up-level this bar.
+        hit_stop = lo <= stop_px if is_long else hi >= stop_px
+        if hit_stop:
+            return _label(banked_r + r_of(stop_px) * remaining, i)
+        reached_1r = (hi >= one_r) if is_long else (lo <= one_r)
+        if not partial_done and reached_1r:
+            banked_r += 1.0 * PARTIAL_FRACTION
+            remaining -= PARTIAL_FRACTION
+            partial_done, stop_px = True, entry  # breakeven on the rest
+        hit_tp = hi >= target if is_long else lo <= target
+        if hit_tp:
+            return _label(banked_r + r_of(target) * remaining, i)
+    return _label(banked_r + r_of(float(closes[last])) * remaining, last)
+
+
+def _label(total_r: float, idx: int) -> tuple[str, float, int]:
+    """Map a blended R outcome to a coarse result label for the trade log."""
+    total_r = round(total_r, 4)
+    if total_r > 0.01:
+        return ("take_profit", total_r, idx)
+    if total_r < -0.01:
+        return ("stop_loss", total_r, idx)
+    return ("markout", total_r, idx)
 
 
 # --------------------------------------------------------------------------- #
 # Indicators
 # --------------------------------------------------------------------------- #
+def _wilder_rsi(close: pd.Series, period: int = 14) -> float:
+    """RSI with Wilder's smoothing (the textbook definition) — the latest value.
+
+    A plain rolling mean over `period` reacts too sharply; Wilder smooths gains
+    and losses with an EMA of alpha = 1/period, which is what every charting
+    package reports, so our 45/72 thresholds line up with what a trader sees.
+    Returns a neutral 50.0 when there isn't enough history.
+    """
+    delta = close.diff().dropna()
+    if len(delta) < period:
+        return 50.0
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = float(gain.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+    avg_loss = float(loss.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100 - 100 / (1 + rs))
+
+
+def _true_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
+    """Average True Range (latest), the real definition that accounts for gaps.
+
+    True range = max(H-L, |H-prevClose|, |L-prevClose|), so an overnight gap
+    widens the stop instead of being ignored. A naive high-low mean under-sizes
+    stops on gappy names and triggers needless stop-outs.
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    tr = tr.dropna()
+    if tr.empty:
+        return float((high - low).tail(min(period, len(high))).mean())
+    return float(tr.tail(min(period, len(tr))).mean())
+
+
 def _indicators(asset: str) -> Optional[dict]:
     """
     Technical snapshot from real daily candles; None if there's too little data
@@ -48,9 +163,9 @@ def _indicators(asset: str) -> Optional[dict]:
     >=25 bars (`bars` is exposed so the caller can gate on it), but the momentum
     + catalyst path runs on thin history too.
     """
-    import yfinance as yf
+    from candles import fetch_history
 
-    df = yf.Ticker(asset).history(period="3mo", interval="1d")
+    df = fetch_history(asset, "3mo", "1d")
     if df is None or df.empty or len(df) < 6:
         return None
     close, high, low = df["Close"], df["High"], df["Low"]
@@ -58,16 +173,11 @@ def _indicators(asset: str) -> Optional[dict]:
     last = float(close.iloc[-1])
     sma20 = float(close.tail(min(20, bars)).mean())
     sma50 = float(close.tail(min(50, bars)).mean())
-    atr = float((high - low).tail(min(14, bars)).mean())
+    atr = _true_atr(high, low, close, period=min(14, bars))
     hi20 = float(high.tail(min(20, bars)).max())
     lo20 = float(low.tail(min(20, bars)).min())
-    if bars >= 15:
-        delta = close.diff()
-        gain = float(delta.clip(lower=0).tail(14).mean())
-        loss = float((-delta.clip(upper=0)).tail(14).mean())
-        rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
-    else:
-        rsi = 50.0  # neutral until there's enough history
+    # Wilder RSI needs ~15 bars to be meaningful; neutral 50 until then.
+    rsi = _wilder_rsi(close, period=14) if bars >= 15 else 50.0
     mom = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
     stop_dist = max(ATR_STOP_MULT * atr, last * 0.005)
     vol = df["Volume"]
@@ -222,9 +332,11 @@ def rules_ticket(asset: str, market_phase: str) -> Optional[ExecutionTicket]:
     if per_unit <= 0:
         logger.warning("RULES %s: zero stop distance — HOLD.", asset)
         return rules_ticket_hold(asset, capital)
-    # Confidence-weighted sizing: scale the risk budget 0.5x–1.0x of the cap by
-    # signal confidence (same hard cap, smaller bets on weak setups).
-    risk_budget = settings.MAX_RISK_DOLLARS * min(1.0, 0.5 + 0.5 * signal.confidence)
+    # Confidence-weighted sizing: scale 0.5x–1.0x of the per-trade cap by signal
+    # confidence (smaller bets on weak setups). The cap itself is 2% of CURRENT
+    # equity (settings.risk_budget), so the book compounds — winners enlarge the
+    # next bet, drawdowns shrink it.
+    risk_budget = settings.risk_budget(capital) * min(1.0, 0.5 + 0.5 * signal.confidence)
     qty = cap_quantity(risk_budget / per_unit, entry, capital)
     # Affordability: a stock that can't make 1 whole share within budget can't be
     # a real Alpaca bracket — HOLD instead of faking a sim fill.

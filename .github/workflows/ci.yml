@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The unit tests only exercise the deterministic core (config, strategy
+      # indicators, execution), so we install just those deps — not the heavy
+      # crewai/streamlit stack — to keep CI fast and reliable.
+      - name: Install test dependencies
+        run: pip install pandas numpy "pydantic>=2.7" python-dotenv requests pytest
+      - name: Run tests
+        run: pytest -q

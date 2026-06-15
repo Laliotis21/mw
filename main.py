@@ -1,11 +1,12 @@
 """
 main.py
 =======
-Orchestrator. Wires agents + tasks into a sequential CrewAI crew, runs one
-decision cycle for a given asset/phase, and paper-executes the resulting ticket.
+Orchestrator. Runs one decision cycle for a given asset/phase and paper-executes
+the resulting ticket.
 
-Pipeline per cycle:
-    Researcher (Perplexity)  ->  Analyst (signal)  ->  Risk Manager (ticket)
+Pipeline per cycle depends on DECISION_ENGINE:
+    rules (default): strategy.rules_ticket (deterministic candles, no LLM)
+    llm:             Researcher -> Analyst (signal) -> Risk Manager (ticket)
         -> execution.execute_ticket() -> trade_log.json
 
 Safety:
@@ -407,6 +408,10 @@ def main() -> int:
             logger.info("Discovery shortlist → trading: %s", ", ".join(assets))
     else:
         assets = args.asset
+
+    # Dedup while preserving order — `--asset AAPL --asset AAPL` must not trade
+    # (or burn LLM tokens on) the same ticker twice in one run.
+    assets = list(dict.fromkeys(assets))
 
     for asset in assets:
         if _circuit_breaker_tripped(day_open_equity):
