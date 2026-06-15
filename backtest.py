@@ -19,14 +19,15 @@ from __future__ import annotations
 
 import argparse
 
-from strategy import ATR_STOP_MULT, REWARD_RISK
+from strategy import ATR_STOP_MULT, REWARD_RISK, simulate_exit
 
 
 def _is_crypto(a: str) -> bool:
     return a.upper().endswith(("-USD", "-USDT", "USDT"))
 
 
-def backtest_asset(asset: str, days: int = 365, max_hold: int = 20) -> dict:
+def backtest_asset(asset: str, days: int = 365, max_hold: int = 20,
+                   exit_style: str = "target") -> dict:
     """Return per-asset stats: trades, win%, expectancy (R), avg R, profit factor."""
     import numpy as np
     import yfinance as yf
@@ -86,27 +87,16 @@ def backtest_asset(asset: str, days: int = 365, max_hold: int = 20) -> dict:
         else:
             stop, target = entry + sd, entry - REWARD_RISK * sd
 
-        # Walk forward; stop assumed to fill first on a straddling bar.
-        outcome_r = 0.0
+        # Walk forward over the next `max_hold` bars via the shared exit engine
+        # (same logic the live paper fill uses), then advance past the window.
         end = min(i + max_hold, n - 1)
-        for j in range(i + 1, end + 1):
-            hj, lj = high[j], low[j]
-            if action == "BUY":
-                if lj <= stop:
-                    outcome_r = -1.0; i = j; break
-                if hj >= target:
-                    outcome_r = REWARD_RISK; i = j; break
-            else:
-                if hj >= stop:
-                    outcome_r = -1.0; i = j; break
-                if lj <= target:
-                    outcome_r = REWARD_RISK; i = j; break
-        else:  # neither hit — mark to close in R
-            exitp = close[end]
-            outcome_r = ((exitp - entry) if action == "BUY" else (entry - exitp)) / sd
-            i = end
+        _, outcome_r, exit_idx = simulate_exit(
+            high[i + 1:end + 1], low[i + 1:end + 1], close[i + 1:end + 1],
+            entry, stop, target, action == "BUY", style=exit_style,
+        )
         r_multiples.append(round(outcome_r, 2))
-        i += 1
+        # Resume scanning the bar after the one that closed the trade.
+        i = i + 1 + exit_idx + 1
 
     if not r_multiples:
         return {"asset": asset, "trades": 0, "note": "no signals"}
@@ -133,16 +123,19 @@ def main() -> int:
     p.add_argument("--asset", action="append", default=[], help="Ticker (repeat).")
     p.add_argument("--days", type=int, default=365)
     p.add_argument("--max-hold", type=int, default=20, help="Max bars to hold a trade.")
+    p.add_argument("--exit-style", choices=["target", "be_partial"], default="target",
+                   help="target = fixed 2R; be_partial = half off at 1R + breakeven stop.")
     a = p.parse_args()
     assets = a.asset or ["AAPL", "MSFT", "NVDA", "SPY", "BTC-USD", "ETH-USD"]
 
-    print(f"\nBACKTEST · technical-only (no news) · {a.days}d · max-hold {a.max_hold} bars")
+    print(f"\nBACKTEST · technical-only (no news) · {a.days}d · max-hold {a.max_hold} bars "
+          f"· exit={a.exit_style}")
     print("-" * 78)
     print(f"{'asset':10} {'trades':>7} {'win%':>6} {'exp(R)':>8} {'totR':>8} {'PF':>6} {'maxDD(R)':>9}")
     agg_r: list[float] = []
     tot_trades = 0
     for asset in assets:
-        s = backtest_asset(asset, a.days, a.max_hold)
+        s = backtest_asset(asset, a.days, a.max_hold, a.exit_style)
         if s["trades"] == 0:
             print(f"{asset:10} {'—':>7}  {s.get('note','')}")
             continue

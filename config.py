@@ -120,11 +120,30 @@ class Settings:
         self.SCAN_PER_SOURCE: int = int(os.getenv("SCAN_PER_SOURCE", "10"))
         self.MAX_CANDIDATES: int = int(os.getenv("MAX_CANDIDATES", "3"))
 
-        # Derived: absolute dollar risk cap per trade. The whole risk engine
-        # keys off this single number ($20 on a $1000 / 2% book).
+        # Derived: dollar risk cap per trade AT THE STARTING book. Kept as a
+        # reference/display figure ($20 on a $1000 / 2% book). The LIVE per-trade
+        # budget compounds — see Settings.risk_budget(), which sizes off CURRENT
+        # equity so wins grow the next bet and losses shrink it.
         self.MAX_RISK_DOLLARS: float = round(
             self.STARTING_CAPITAL * self.MAX_RISK_PCT, 2
         )
+
+        # Exit management for simulated/backtested fills (strategy & paper engine):
+        #   'target'     -> first of fixed stop / 2R target, else mark-to-close.
+        #   'be_partial' -> bank half the position at +1R and move the stop to
+        #                   breakeven; the rest runs to the 2R target. Cuts full
+        #                   losers and locks partial gains (see backtest to A/B).
+        self.EXIT_STYLE: str = os.getenv("EXIT_STYLE", "be_partial").lower()
+
+    def risk_budget(self, capital: float) -> float:
+        """Dollar risk for ONE trade at the given (current) equity.
+
+        This is what makes the book COMPOUND: risk is MAX_RISK_PCT of the live
+        equity, not a constant pinned to the starting capital. A $1000 book that
+        grows to $1500 then risks $30/trade, not $20; a drawn-down book risks
+        less. Never negative.
+        """
+        return round(max(capital, 0.0) * self.MAX_RISK_PCT, 2)
 
     def require(self, *keys: str) -> None:
         """Raise if any named setting is empty. Call before a live cycle."""
@@ -317,14 +336,17 @@ class ExecutionTicket(BaseModel):
         # LLMs love emitting null here — backfill so validation never trips.
         return v or datetime.now(timezone.utc).isoformat()
 
-    @field_validator("risk_dollars")
-    @classmethod
-    def _risk_cap(cls, v: float) -> float:
-        if v > settings.MAX_RISK_DOLLARS + 0.01:  # cent tolerance for rounding
+    @model_validator(mode="after")
+    def _risk_cap(self) -> "ExecutionTicket":
+        # Cap risk at MAX_RISK_PCT of the book AT OPEN, so the hard limit
+        # compounds with equity instead of being frozen at the starting figure.
+        cap = self.capital_at_open * settings.MAX_RISK_PCT
+        if self.risk_dollars > cap + 0.01:  # cent tolerance for rounding
             raise ValueError(
-                f"risk_dollars ${v} exceeds hard cap ${settings.MAX_RISK_DOLLARS}."
+                f"risk_dollars ${self.risk_dollars} exceeds {settings.MAX_RISK_PCT*100:.0f}% "
+                f"of capital ${self.capital_at_open} (cap ${cap:.2f})."
             )
-        return v
+        return self
 
     @model_validator(mode="after")
     def _check_geometry(self) -> "ExecutionTicket":

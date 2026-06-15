@@ -315,30 +315,22 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
         sl, tp = entry * (1 + risk_pct), entry * (1 - rew_pct)
 
     per_unit_risk = abs(entry - sl)
-    qty = settings.MAX_RISK_DOLLARS / per_unit_risk if per_unit_risk > 0 else 0.0
+    # Compounding: size off 2% of the book AT OPEN (not the frozen starting cap).
+    budget = settings.risk_budget(ticket.capital_at_open)
+    qty = budget / per_unit_risk if per_unit_risk > 0 else 0.0
     qty = cap_quantity(qty, entry, ticket.capital_at_open)  # no leverage: notional <= capital
 
-    # Walk the window forward from the entry bar. On a bar that straddles both,
-    # assume the stop hits first (conservative — never flatter the result).
-    result, exit_price = "markout", float(closes.iloc[-1])
-    for i in range(len(window)):
-        hi, lo = float(highs.iloc[i]), float(lows.iloc[i])
-        if is_long:
-            if lo <= sl:
-                result, exit_price = "stop_loss", sl
-                break
-            if hi >= tp:
-                result, exit_price = "take_profit", tp
-                break
-        else:
-            if hi >= sl:
-                result, exit_price = "stop_loss", sl
-                break
-            if lo <= tp:
-                result, exit_price = "take_profit", tp
-                break
+    # Resolve over the held-out window using the configured exit style (shared
+    # with the backtest). R is in units of initial risk; convert to dollars.
+    from strategy import simulate_exit
 
-    pnl = (exit_price - entry) * qty if is_long else (entry - exit_price) * qty
+    result, realized_r, _ = simulate_exit(
+        highs.tolist(), lows.tolist(), closes.tolist(),
+        entry, sl, tp, is_long, style=settings.EXIT_STYLE,
+    )
+    pnl = realized_r * per_unit_risk * qty
+    # Effective exit price implied by the realized R (for the blotter).
+    exit_price = entry + realized_r * per_unit_risk if is_long else entry - realized_r * per_unit_risk
 
     return {
         "result": result,

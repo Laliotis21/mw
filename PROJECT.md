@@ -92,8 +92,13 @@ Routing: `binance` → crypto only · `alpaca` → stocks only · `live` → bot
 
 ## Risk & safety
 
-- **Hard risk cap**: `MAX_RISK_DOLLARS = STARTING_CAPITAL × MAX_RISK_PCT`
-  (default $20 on $1000 @ 2%). Enforced in `ExecutionTicket._risk_cap`.
+- **Compounding risk cap**: each trade risks `MAX_RISK_PCT` of the **current**
+  equity via `settings.risk_budget(capital)` ($20 @ $1000, $30 @ $1500), and
+  `ExecutionTicket._risk_cap` enforces `risk_dollars ≤ capital_at_open × MAX_RISK_PCT`.
+  `MAX_RISK_DOLLARS` is kept as the starting-book reference/display figure.
+- **Exit style** (`EXIT_STYLE`): `be_partial` (default) banks half at +1R and
+  trails the stop to breakeven; `target` is the fixed 2R exit. Shared by the
+  paper fill and `backtest.py` (`strategy.simulate_exit`) so both measure the same logic.
 - **Geometry invariant**: BUY needs `stop < entry < target`; SELL the reverse.
 - **No leverage**: `cap_quantity` clamps notional ≤ capital.
 - **Daily circuit breaker**: bot stands down if day drawdown ≥
