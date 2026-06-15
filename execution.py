@@ -503,6 +503,28 @@ def performance_summary() -> dict:
         peak = max(peak, running)
         max_dd = max(max_dd, peak - running)
 
+    # Edge analytics over realized trades (anything that closed with real P&L).
+    closed = [t for t in trades if t["result"] in
+              ("take_profit", "stop_loss", "markout", "manual_close")]
+    pnls = [t["pnl"] for t in closed]
+    cwin = [p for p in pnls if p > 0]
+    closs = [p for p in pnls if p < 0]
+    gross_win = sum(cwin)
+    gross_loss = abs(sum(closs))
+    rs = [t["pnl"] / t["risk_dollars"] for t in closed
+          if float(t.get("risk_dollars", 0) or 0) > 0]
+
+    def _is_crypto(a):
+        return str(a).upper().endswith(("-USD", "-USDT", "USDT"))
+
+    def _wr(subset):
+        r = [t for t in subset if t["result"] in ("take_profit", "stop_loss")]
+        w = [t for t in r if t["pnl"] > 0]
+        return round(len(w) / len(r) * 100, 1) if r else 0.0
+
+    crypto_t = [t for t in closed if _is_crypto(t["asset"])]
+    stock_t = [t for t in closed if not _is_crypto(t["asset"])]
+
     return {
         "starting_capital": start,
         "current_equity": equity,
@@ -513,4 +535,15 @@ def performance_summary() -> dict:
         "win_rate_pct": round(len(wins) / len(resolved) * 100, 2) if resolved else 0.0,
         "max_drawdown_dollars": round(max_dd, 2),
         "max_drawdown_pct": round(max_dd / peak * 100, 2) if peak else 0.0,
+        # Edge metrics
+        "closed_trades": len(closed),
+        "expectancy": round(sum(pnls) / len(pnls), 2) if pnls else 0.0,
+        "avg_win": round(gross_win / len(cwin), 2) if cwin else 0.0,
+        "avg_loss": round(-gross_loss / len(closs), 2) if closs else 0.0,
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else (999.0 if gross_win else 0.0),
+        "avg_r": round(sum(rs) / len(rs), 2) if rs else 0.0,
+        "stock_win_pct": _wr(stock_t),
+        "crypto_win_pct": _wr(crypto_t),
+        "stock_pnl": round(sum(t["pnl"] for t in stock_t), 2),
+        "crypto_pnl": round(sum(t["pnl"] for t in crypto_t), 2),
     }

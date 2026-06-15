@@ -320,6 +320,30 @@ def autorun_html(meta: dict) -> str:
             f'<span style="color:#6e7d92">  {body}</span></div>')
 
 
+def analytics_html(perf: dict) -> str:
+    """Edge metrics strip: expectancy, profit factor, avg R, by asset class."""
+    if perf.get("closed_trades", 0) == 0:
+        return ('<div style="font-family:Fira Code,monospace;font-size:.68rem;color:#6e7d92;'
+                'margin:-.4rem 0 .9rem">📐 EDGE  —  no closed trades yet.</div>')
+    exp, pf, ar = perf["expectancy"], perf["profit_factor"], perf["avg_r"]
+    exp_c = GREEN if exp > 0 else (RED if exp < 0 else MUTED)
+    pf_c = GREEN if pf >= 1 else RED
+    cells = [
+        ("EXPECTANCY", f"${exp:+,.2f}/trade", exp_c),
+        ("PROFIT FACTOR", f"{pf:.2f}", pf_c),
+        ("AVG R", f"{ar:+.2f}R", GREEN if ar > 0 else RED),
+        ("AVG W/L", f"${perf['avg_win']:,.2f} / ${perf['avg_loss']:,.2f}", "#c9d6e3"),
+        ("STOCK", f"{perf['stock_win_pct']:.0f}% · ${perf['stock_pnl']:+,.0f}", "#c9d6e3"),
+        ("CRYPTO", f"{perf['crypto_win_pct']:.0f}% · ${perf['crypto_pnl']:+,.0f}", "#c9d6e3"),
+    ]
+    inner = "   ·   ".join(
+        f'<span style="color:#6e7d92">{k}</span> <span style="color:{c}">{v}</span>'
+        for k, v, c in cells)
+    return (f'<div style="font-family:Fira Code,monospace;font-size:.7rem;'
+            f'border:1px solid #1c2735;border-radius:6px;padding:.4rem .7rem;'
+            f'margin:-.3rem 0 .9rem;background:#0c121b">📐 {inner}</div>')
+
+
 def _show_trade_result(asset: str, ticket, record) -> None:
     action = ticket.action.value
     if action == "HOLD" or record["quantity"] == 0:
@@ -489,8 +513,10 @@ every = float(interval) if live else None
 def header_kpi() -> None:
     log = _load_log()
     df = pd.DataFrame(log["trades"]) if log["trades"] else pd.DataFrame()
+    perf = performance_summary()
     st.markdown(topbar_html(live), unsafe_allow_html=True)
-    st.markdown(kpi_html(performance_summary(), df), unsafe_allow_html=True)
+    st.markdown(kpi_html(perf, df), unsafe_allow_html=True)
+    st.markdown(analytics_html(perf), unsafe_allow_html=True)
     st.markdown(ledger_html(log["meta"]), unsafe_allow_html=True)
     st.markdown(autorun_html(log["meta"]), unsafe_allow_html=True)
     st.markdown(last_run_html(log["meta"]), unsafe_allow_html=True)

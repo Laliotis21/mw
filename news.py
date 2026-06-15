@@ -74,6 +74,30 @@ def fetch_news(symbol: str, limit: int = 10) -> list[dict]:
         return []
 
 
+def _clean(items: list[dict]) -> list[dict]:
+    """Precision filter: drop stale (>72h), generic round-ups (>5 symbols), and
+    duplicate headlines — so the score reflects real, relevant, fresh news."""
+    out, seen = [], set()
+    now = datetime.now(timezone.utc)
+    for i in items:
+        head = (i.get("headline") or "").strip()
+        if not head or head.lower() in seen:
+            continue
+        if len(i.get("symbols") or []) > 5:  # market round-up, not asset-specific
+            continue
+        ts = i.get("created_at")
+        if ts:
+            try:
+                age = (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 3600
+                if age > 72:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        seen.add(head.lower())
+        out.append(i)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Sentiment
 # --------------------------------------------------------------------------- #
@@ -140,6 +164,7 @@ def news_signal(symbol: str) -> dict:
     IPO/news-driven momentum move the technicals can't see yet.
     """
     items = fetch_news(symbol)
+    items = _clean(items)
     if not items:
         return {"score": 0.0, "n": 0, "catalyst": False, "fresh_hours": None,
                 "top": "", "source": "none"}

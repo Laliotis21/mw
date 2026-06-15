@@ -70,9 +70,13 @@ def _indicators(asset: str) -> Optional[dict]:
         rsi = 50.0  # neutral until there's enough history
     mom = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
     stop_dist = max(ATR_STOP_MULT * atr, last * 0.005)
+    vol = df["Volume"]
+    avg_vol = float(vol.tail(min(20, bars)).mean())
+    vol_ok = avg_vol <= 0 or float(vol.iloc[-1]) >= 0.7 * avg_vol  # participation
     return {
         "last": last, "sma20": sma20, "sma50": sma50, "atr": atr, "rsi": rsi,
-        "hi20": hi20, "lo20": lo20, "mom": mom, "stop_dist": stop_dist, "bars": bars,
+        "hi20": hi20, "lo20": lo20, "mom": mom, "stop_dist": stop_dist,
+        "bars": bars, "vol_ok": vol_ok,
     }
 
 
@@ -147,8 +151,12 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     breakdown = last <= lo20 * 1.001
     rsi_long_ok = 45.0 <= rsi <= 72.0
     rsi_short_ok = 28.0 <= rsi <= 55.0
-    buy = (up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)
-    sell = (down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)
+    # Entry confirmation: need real volume (participation) and don't chase a
+    # price already stretched >8% above SMA20.
+    vol_ok = ind.get("vol_ok", True)
+    extended = last > sma20 * 1.08
+    buy = ((up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)) and vol_ok and not extended
+    sell = ((down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)) and vol_ok
 
     if crypto and sell and not buy:  # spot crypto is long-only — never short
         return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
