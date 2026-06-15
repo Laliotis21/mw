@@ -254,12 +254,24 @@ def rules_discovery(market_phase: str) -> OpportunityShortlist:
     except ValueError:
         phase = MarketPhase.MID_DAY
 
-    raw = (fetch_stock_movers(phase.value) or []) + (fetch_crypto_movers(phase.value) or [])
-    # Rank by conviction: bigger |move| and real volume first.
-    raw.sort(key=lambda d: (abs(d.get("raw_score", 0.0)), d.get("volume") or 0), reverse=True)
+    key = lambda d: (abs(d.get("raw_score", 0.0)), d.get("volume") or 0)  # noqa: E731
+    stocks = sorted(fetch_stock_movers(phase.value) or [], key=key, reverse=True)
+    crypto = sorted(fetch_crypto_movers(phase.value) or [], key=key, reverse=True)
+
+    # Balance the shortlist: crypto has bigger % swings and would crowd out
+    # stocks on a pure |move| sort, yet stocks trade real on Alpaca and can be
+    # shorted. Round-robin stock,crypto,... (stocks first) to guarantee both.
+    n = max(settings.MAX_CANDIDATES * 2, 8)
+    balanced: list[dict] = []
+    si = ci = 0
+    while len(balanced) < n and (si < len(stocks) or ci < len(crypto)):
+        if si < len(stocks):
+            balanced.append(stocks[si]); si += 1
+        if ci < len(crypto) and len(balanced) < n:
+            balanced.append(crypto[ci]); ci += 1
 
     ideas = []
-    for d in raw[: max(settings.MAX_CANDIDATES * 2, 8)]:
+    for d in balanced:
         try:
             ideas.append(TradeIdea(**{k: d.get(k) for k in
                          ("asset", "asset_class", "raw_score", "change_pct",

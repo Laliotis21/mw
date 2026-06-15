@@ -109,6 +109,20 @@ def _llm_sentiment(symbol: str, texts: list[str]) -> Optional[float]:
                 ),
             }],
         )
+        # Roll this call's cost into the trade-log ledger so news sentiment spend
+        # isn't invisible (the dashboard API-spend total must stay honest).
+        try:
+            from execution import log_usage
+            u = msg.usage
+            log_usage({
+                "model": settings.ANTHROPIC_MODEL,
+                "prompt_tokens": int(getattr(u, "input_tokens", 0) or 0),
+                "completion_tokens": int(getattr(u, "output_tokens", 0) or 0),
+                "cached_tokens": int(getattr(u, "cache_read_input_tokens", 0) or 0),
+                "requests": 1,
+            })
+        except Exception:  # noqa: BLE001 — never let accounting break a signal
+            pass
         txt = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         return max(-1.0, min(1.0, float(txt.strip().split()[0])))
     except Exception as exc:  # noqa: BLE001
