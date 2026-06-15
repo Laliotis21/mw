@@ -20,10 +20,34 @@ import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+from datetime import timedelta, timezone
+
 from binance_broker import is_crypto
 from config import current_market_phase, logger, settings
-from execution import current_equity, execute_ticket, log_usage, reconcile_open
+from execution import (
+    current_equity,
+    execute_ticket,
+    log_usage,
+    reconcile_open,
+    set_autorun_status,
+)
 from main import _circuit_breaker_tripped, pop_last_usage, run_cycle, run_discovery
+
+
+def _publish_status(cycle: int, note: str, traded: int, held: int, mkt_open: bool) -> None:
+    """Write the scheduler heartbeat so the dashboard can show what it's doing."""
+    now = datetime.now(timezone.utc)
+    set_autorun_status({
+        "cycle": cycle,
+        "interval_min": settings.AUTORUN_INTERVAL_MIN,
+        "last_run_utc": now.isoformat(),
+        "next_run_utc": (now + timedelta(minutes=settings.AUTORUN_INTERVAL_MIN)).isoformat(),
+        "market_open": mkt_open,
+        "traded": traded,
+        "held": held,
+        "note": note,
+        "equity": current_equity(),
+    })
 
 
 def us_market_open() -> bool:
@@ -44,35 +68,47 @@ def us_market_open() -> bool:
     return (et.hour, et.minute) >= (9, 30) and et.hour < 16
 
 
-def run_once(day_open_equity: float) -> None:
+def run_once(day_open_equity: float, cycle: int) -> None:
     """One autonomous cycle: discover, gate per asset class, trade, reconcile."""
+    mkt_open = us_market_open()
+    logger.info("AUTORUN cycle #%d | phase=%s market_open=%s", cycle,
+                current_market_phase().value, mkt_open)
     reconcile_open()  # settle anything that closed since last tick
 
     if _circuit_breaker_tripped(day_open_equity):
-        logger.info("AUTORUN: circuit breaker tripped today — standing down.")
+        logger.info("AUTORUN #%d: circuit breaker tripped — standing down.", cycle)
+        _publish_status(cycle, "circuit-breaker — stood down", 0, 0, mkt_open)
         return
 
     phase = current_market_phase().value
     shortlist = run_discovery(phase)
     log_usage(pop_last_usage())
     if shortlist is None or not shortlist.ideas:
-        logger.info("AUTORUN: no ideas this cycle.")
+        logger.info("AUTORUN #%d: no ideas this cycle.", cycle)
+        _publish_status(cycle, "no tradable ideas", 0, 0, mkt_open)
         return
 
-    mkt_open = us_market_open()
+    traded = held = 0
     for idea in shortlist.ideas[: settings.MAX_CANDIDATES]:
         if _circuit_breaker_tripped(day_open_equity):
             break
         # Gate: stocks only during market hours; crypto always.
         if not is_crypto(idea.asset) and not mkt_open:
-            logger.info("AUTORUN: skip stock %s — US market closed.", idea.asset)
+            logger.info("AUTORUN #%d: skip stock %s — US market closed.", cycle, idea.asset)
             continue
         ticket = run_cycle(idea.asset, phase)
         usage = pop_last_usage()
         if ticket is None:
             log_usage(usage)
             continue
-        execute_ticket(ticket, market_phase=phase, usage=usage)
+        rec = execute_ticket(ticket, market_phase=phase, usage=usage)
+        if rec.get("result") == "no_trade":
+            held += 1
+        else:
+            traded += 1
+    logger.info("AUTORUN #%d done | %d traded / %d hold | equity $%.2f",
+                cycle, traded, held, current_equity())
+    _publish_status(cycle, "ok", traded, held, mkt_open)
 
 
 def main() -> None:
@@ -82,14 +118,16 @@ def main() -> None:
                 settings.DECISION_ENGINE, settings.FILL_SOURCE)
     day = date.today()
     day_open_equity = current_equity()
+    cycle = 0
     while True:
         if date.today() != day:  # new trading day → reset the loss baseline
             day, day_open_equity = date.today(), current_equity()
             logger.info("AUTORUN: new day, equity baseline $%.2f", day_open_equity)
+        cycle += 1
         try:
-            run_once(day_open_equity)
+            run_once(day_open_equity, cycle)
         except Exception as exc:  # noqa: BLE001 — never let one cycle kill the loop
-            logger.error("AUTORUN cycle error: %s", exc)
+            logger.error("AUTORUN cycle #%d error: %s", cycle, exc)
         time.sleep(interval)
 
 

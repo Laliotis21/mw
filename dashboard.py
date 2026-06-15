@@ -280,6 +280,38 @@ def last_run_html(meta: dict) -> str:
             f'<span style="color:#6e7d92">   ·   {assets}</span></div>')
 
 
+def autorun_html(meta: dict) -> str:
+    """Live status of the autonomous scheduler: cycle, last/next, last action."""
+    a = meta.get("autorun")
+    if not a:
+        return ('<div style="font-family:Fira Code,monospace;font-size:.68rem;color:#6e7d92;'
+                'margin:-.4rem 0 .9rem">🤖 AUTORUN  —  off. Start <code>scheduler.py</code> '
+                'for hands-free trading.</div>')
+    interval = a.get("interval_min", 30)
+    try:
+        last = pd.to_datetime(a.get("last_run_utc"), utc=True)
+        age_min = (datetime.now(timezone.utc) - last.to_pydatetime()).total_seconds() / 60
+        last_s = last.strftime("%H:%M")
+    except Exception:  # noqa: BLE001
+        age_min, last_s = 9999, "—"
+    try:
+        nxt_s = pd.to_datetime(a.get("next_run_utc"), utc=True).strftime("%H:%M")
+    except Exception:  # noqa: BLE001
+        nxt_s = "—"
+    stale = age_min > interval * 2.5
+    dot = '<span class="livedot off"></span>' if stale else '<span class="livedot"></span>'
+    head = "AUTORUN IDLE (scheduler stopped?)" if stale else "AUTORUN LIVE"
+    color = "#6e7d92" if stale else "#16c784"
+    body = (f'cycle #{a.get("cycle",0)} · every {interval}m · last {last_s} UTC · '
+            f'next ~{nxt_s} · {a.get("traded",0)} trade/{a.get("held",0)} hold · '
+            f'{a.get("note","")} · eq ${a.get("equity",0):,.2f}')
+    return (f'<div style="font-family:Fira Code,monospace;font-size:.7rem;'
+            f'border:1px solid #1c2735;border-radius:6px;padding:.4rem .7rem;'
+            f'margin:-.3rem 0 .9rem;background:#0c121b">{dot}'
+            f'<span style="color:{color};font-weight:600">🤖 {head}</span> '
+            f'<span style="color:#6e7d92">  {body}</span></div>')
+
+
 def _show_trade_result(asset: str, ticket, record) -> None:
     action = ticket.action.value
     if action == "HOLD" or record["quantity"] == 0:
@@ -459,6 +491,7 @@ def header_kpi() -> None:
     st.markdown(topbar_html(live), unsafe_allow_html=True)
     st.markdown(kpi_html(performance_summary(), df), unsafe_allow_html=True)
     st.markdown(ledger_html(log["meta"]), unsafe_allow_html=True)
+    st.markdown(autorun_html(log["meta"]), unsafe_allow_html=True)
     st.markdown(last_run_html(log["meta"]), unsafe_allow_html=True)
 
 

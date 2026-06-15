@@ -121,6 +121,13 @@ def set_last_run(summary: dict) -> None:
     _save_log(log)
 
 
+def set_autorun_status(status: dict) -> None:
+    """Persist the autonomous scheduler's heartbeat/status for the dashboard."""
+    log = _load_log()
+    log["meta"]["autorun"] = status
+    _save_log(log)
+
+
 # --------------------------------------------------------------------------- #
 # Persistence helpers — the log is a single JSON doc: {meta, trades:[...]}.
 # --------------------------------------------------------------------------- #
