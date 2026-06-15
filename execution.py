@@ -21,9 +21,48 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config import Action, ExecutionTicket, logger, settings
+from config import Action, ExecutionTicket, cap_quantity, logger, settings
+from usage import cost_usd
 
 TRADE_LOG = Path(__file__).parent / "trade_log.json"
+
+
+# --------------------------------------------------------------------------- #
+# Token-cost ledger — accumulates LLM spend in the log's meta so the dashboard
+# can show real $/trade and total API spend.
+# --------------------------------------------------------------------------- #
+def _bump_meta_usage(log: dict, usage: Optional[dict]) -> float:
+    """Roll one usage bundle into meta totals; return this bundle's dollar cost."""
+    if not usage:
+        return 0.0
+    cost = cost_usd(
+        usage.get("model", ""),
+        int(usage.get("prompt_tokens", 0) or 0),
+        int(usage.get("completion_tokens", 0) or 0),
+        int(usage.get("cached_tokens", 0) or 0),
+    )
+    m = log["meta"].setdefault(
+        "usage",
+        {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0,
+         "requests": 0, "cost_usd": 0.0, "model": usage.get("model", "")},
+    )
+    m["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+    m["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+    m["cached_tokens"] += int(usage.get("cached_tokens", 0) or 0)
+    m["requests"] += int(usage.get("requests", 0) or 0)
+    m["cost_usd"] = round(m["cost_usd"] + cost, 6)
+    if usage.get("model"):
+        m["model"] = usage["model"]
+    return cost
+
+
+def log_usage(usage: Optional[dict]) -> None:
+    """Record token usage not tied to a trade (e.g. the discovery crew)."""
+    if not usage:
+        return
+    log = _load_log()
+    _bump_meta_usage(log, usage)
+    _save_log(log)
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +112,28 @@ def simulate_fill(
     if ticket.action == Action.HOLD or ticket.quantity == 0:
         return {"result": "no_trade", "pnl": 0.0}
 
-    if settings.FILL_SOURCE == "yfinance" and outcome is None:
+    # Live paper brokers: route per asset to a real bracket order. Returns an
+    # 'open' record; reconcile_open() realizes P&L later. Anything a broker can't
+    # route (wrong asset class / qty<min / API down) returns None → fall through
+    # to the local sim below.
+    #   binance -> crypto only | alpaca -> stocks only | live -> both
+    if settings.FILL_SOURCE in ("binance", "alpaca", "live") and outcome is None:
+        from binance_broker import is_crypto
+
+        real = None
+        if is_crypto(ticket.asset) and settings.FILL_SOURCE in ("binance", "live"):
+            from binance_broker import place_bracket as _binance_bracket
+
+            real = _binance_bracket(ticket)
+        elif not is_crypto(ticket.asset) and settings.FILL_SOURCE in ("alpaca", "live"):
+            from alpaca_broker import place_bracket as _alpaca_bracket
+
+            real = _alpaca_bracket(ticket)
+        if real is not None:
+            return real
+        logger.warning("Broker can't route %s — falling back to yfinance.", ticket.asset)
+
+    if settings.FILL_SOURCE in ("yfinance", "binance", "alpaca", "live") and outcome is None:
         try:
             real = _yfinance_fill(ticket, market_phase)
             if real is not None:
@@ -108,37 +168,33 @@ def _coinflip_fill(ticket: ExecutionTicket, outcome: Optional[str]) -> dict:
 
 def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Optional[dict]:
     """
-    Resolve the trade against real market bars.
+    Resolve the trade against real market bars — WITHOUT lookahead.
 
-    Uses the SAME period/interval the Researcher scanned for this phase, so the
-    fill and the research see the same candles. Entry is the first bar of the
-    most recent session (today's open-ish), not days ago — so the fill entry
-    lines up with the price the agents actually analysed. We then walk forward
-    bar by bar: whichever of stop / target price touches first decides the
-    outcome; if neither, mark to the last close (a "markout").
+    Uses the SAME period/interval the Researcher scanned, then resolves the trade
+    only over candles.HOLDOUT_BARS — the most recent bars that candle_scan
+    explicitly DROPS before computing its signals. So the agent decides on history
+    strictly before the entry and we walk that out-of-sample window forward: entry
+    is the open of the first held-out bar, then whichever of stop / target touches
+    first decides the outcome; if neither, mark to the last close (a "markout").
 
-    The agent's entry/stop/target may be on approximate numbers, so we keep only
-    their RELATIVE geometry (risk % and reward %) and re-anchor to the real
-    entry. Position size is recomputed so dollar risk respects the hard cap.
+    The agent's entry/stop/target may be approximate, so we keep only their
+    RELATIVE geometry (risk % and reward %) and re-anchor to the real entry.
+    Position size is recomputed so dollar risk respects the hard cap.
     Returns None if no usable price data (caller falls back to coinflip).
     """
     import yfinance as yf
 
-    from candles import phase_data
+    from candles import HOLDOUT_BARS, phase_data
 
     period, interval = phase_data(market_phase)
     df = yf.Ticker(ticket.asset).history(period=period, interval=interval)
-    if df is None or df.empty or len(df) < 5:
+    if df is None or df.empty or len(df) < HOLDOUT_BARS + 2:
         return None
 
-    # Holding window = the most recent session's bars (intraday, recent entry).
-    # Fall back to the last ~26 bars if the session can't be isolated.
-    last_day = df.index[-1].date()
-    day = df[df.index.map(lambda ts: ts.date() == last_day)]
-    window = day if len(day) >= 3 else df.tail(26)
-
-    closes, highs, lows = window["Close"], window["High"], window["Low"]
-    entry = float(closes.iloc[0])  # real entry = first bar of the recent session
+    # Out-of-sample window: exactly the bars candle_scan held out of analysis.
+    window = df.iloc[-HOLDOUT_BARS:]
+    opens, closes, highs, lows = window["Open"], window["Close"], window["High"], window["Low"]
+    entry = float(opens.iloc[0])  # enter at the open of the first unseen bar
 
     # Relative geometry from the agent's ticket (fractions of entry price).
     risk_pct = max(abs(ticket.entry_price - ticket.stop_loss) / ticket.entry_price, 0.001)
@@ -152,11 +208,12 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
 
     per_unit_risk = abs(entry - sl)
     qty = settings.MAX_RISK_DOLLARS / per_unit_risk if per_unit_risk > 0 else 0.0
+    qty = cap_quantity(qty, entry, ticket.capital_at_open)  # no leverage: notional <= capital
 
-    # Walk forward. On a bar that straddles both, assume the stop hits first
-    # (conservative — never flatter the result).
+    # Walk the window forward from the entry bar. On a bar that straddles both,
+    # assume the stop hits first (conservative — never flatter the result).
     result, exit_price = "markout", float(closes.iloc[-1])
-    for i in range(1, len(window)):
+    for i in range(len(window)):
         hi, lo = float(highs.iloc[i]), float(lows.iloc[i])
         if is_long:
             if lo <= sl:
@@ -183,6 +240,7 @@ def _yfinance_fill(ticket: ExecutionTicket, market_phase: str = "mid_day") -> Op
         "take_profit": round(tp, 2),
         "quantity": round(qty, 4),
         "exit_price": round(exit_price, 2),
+        "risk_dollars": round(per_unit_risk * qty, 2),  # real risk on re-anchored qty
         "fill_source": "yfinance",
     }
 
@@ -194,18 +252,25 @@ def execute_ticket(
     ticket: ExecutionTicket,
     outcome: Optional[str] = None,
     market_phase: str = "mid_day",
+    usage: Optional[dict] = None,
 ) -> dict:
     """
     Paper-execute a ticket: simulate the fill, update equity, persist the record.
 
     `market_phase` is forwarded to the fill so it uses the same candles the
-    Researcher scanned. Returns the trade record (also appended to trade_log.json).
+    Researcher scanned. `usage` is the CrewAI token usage for the cycle that
+    produced this ticket — its dollar cost is stored on the record and rolled
+    into the log's running API-spend total. Returns the trade record (also
+    appended to trade_log.json).
     """
     log = _load_log()
     equity_before = log["meta"]["equity"]
 
     fill = simulate_fill(ticket, outcome=outcome, market_phase=market_phase)
     equity_after = round(equity_before + fill["pnl"], 2)
+
+    # Attribute this cycle's LLM token cost to the trade + the run ledger.
+    cycle_cost = _bump_meta_usage(log, usage)
 
     # Prefer real fill values (yfinance re-anchors price/qty) over the ticket's.
     record = {
@@ -217,7 +282,9 @@ def execute_ticket(
         "stop_loss": fill.get("stop_loss", ticket.stop_loss),
         "take_profit": fill.get("take_profit", ticket.take_profit),
         "exit_price": fill.get("exit_price"),
-        "risk_dollars": ticket.risk_dollars,
+        # Real-fill paths re-anchor qty to live price, so risk_dollars must come
+        # from the fill too — else logged risk != quantity * stop distance.
+        "risk_dollars": fill.get("risk_dollars", ticket.risk_dollars),
         "reward_risk_ratio": ticket.reward_risk_ratio,
         "result": fill["result"],
         "pnl": fill["pnl"],
@@ -225,6 +292,13 @@ def execute_ticket(
         "equity_before": equity_before,
         "equity_after": equity_after,
         "rationale": ticket.rationale,
+        # Open-bracket broker refs (present only for live/testnet orders).
+        "binance_symbol": fill.get("binance_symbol"),
+        "binance_order_list_id": fill.get("binance_order_list_id"),
+        "alpaca_order_id": fill.get("alpaca_order_id"),
+        # LLM cost to produce this ticket (0.0 for free local models).
+        "llm_cost_usd": round(cycle_cost, 6),
+        "llm_tokens": (usage or {}).get("total_tokens", 0),
     }
 
     log["trades"].append(record)
@@ -243,14 +317,57 @@ def execute_ticket(
     return record
 
 
+def reconcile_open() -> int:
+    """
+    Resolve any open Binance brackets whose OCO has finished. Updates each
+    trade's result/exit/pnl in place and rolls realized P&L into equity.
+    Returns the count of trades newly resolved. Safe to call repeatedly.
+    """
+    import binance_broker
+    import alpaca_broker
+
+    log = _load_log()
+    resolved = 0
+    for t in log["trades"]:
+        if t.get("result") != "open":
+            continue
+        src = t.get("fill_source", "")
+        if src.startswith("binance"):
+            out = binance_broker.reconcile_bracket(t)
+        elif src.startswith("alpaca"):
+            out = alpaca_broker.reconcile_bracket(t)
+        else:
+            out = None
+        if out is None:
+            continue
+        result, exit_price, pnl = out
+        t["result"] = result
+        t["exit_price"] = exit_price
+        t["pnl"] = pnl
+        new_equity = round(log["meta"]["equity"] + pnl, 2)
+        t["equity_after"] = new_equity
+        log["meta"]["equity"] = new_equity
+        resolved += 1
+        logger.info("RECONCILED %s %s pnl=$%.2f equity=$%.2f",
+                    t["asset"], result, pnl, new_equity)
+    if resolved:
+        _save_log(log)
+    return resolved
+
+
 def performance_summary() -> dict:
     """Aggregate stats over the whole log: win rate, P&L, max drawdown."""
     log = _load_log()
-    trades = [t for t in log["trades"] if t["result"] not in ("no_trade",)]
+    # 'open' = Binance bracket not yet resolved; not a settled trade yet.
+    trades = [t for t in log["trades"] if t["result"] not in ("no_trade", "open")]
     start = log["meta"]["starting_capital"]
     equity = log["meta"]["equity"]
 
-    wins = [t for t in trades if t["pnl"] > 0]
+    # Win rate only over trades that actually hit TP or SL. "markout" trades
+    # (mark-to-close, neither level touched) are not a win/loss signal — counting
+    # a fractionally-positive markout as a win inflates the rate.
+    resolved = [t for t in trades if t["result"] in ("take_profit", "stop_loss")]
+    wins = [t for t in resolved if t["pnl"] > 0]
     # Max drawdown across the equity curve.
     peak = start
     max_dd = 0.0
@@ -266,7 +383,8 @@ def performance_summary() -> dict:
         "net_pnl": round(equity - start, 2),
         "return_pct": round((equity - start) / start * 100, 2) if start else 0.0,
         "total_trades": len(trades),
-        "win_rate_pct": round(len(wins) / len(trades) * 100, 2) if trades else 0.0,
+        "resolved_trades": len(resolved),
+        "win_rate_pct": round(len(wins) / len(resolved) * 100, 2) if resolved else 0.0,
         "max_drawdown_dollars": round(max_dd, 2),
         "max_drawdown_pct": round(max_dd / peak * 100, 2) if peak else 0.0,
     }

@@ -33,6 +33,13 @@ PHASE_DATA = {
     MarketPhase.CLOSE: ("1d", "5m"),
 }
 
+# Bars held out of the research window. The Researcher computes signals only on
+# bars STRICTLY BEFORE these; the fill (execution._yfinance_fill) enters at the
+# first held-out bar and resolves the trade over them. The two never overlap, so
+# the agent cannot "decide" using price action it then trades into — this is what
+# keeps the paper win rate honest instead of lookahead-inflated.
+HOLDOUT_BARS = 12
+
 
 def phase_data(market_phase: str) -> tuple[str, str]:
     """(period, interval) for a phase — shared by research scan and fill sim."""
@@ -114,7 +121,7 @@ def candle_scan(asset: str, market_phase: str) -> dict:
         logger.error("candle_scan fetch failed for %s: %s", asset, exc)
         df = None
 
-    if df is None or df.empty or len(df) < 25:
+    if df is None or df.empty or len(df) < 25 + HOLDOUT_BARS:
         return {
             "asset": asset,
             "market_phase": phase.value,
@@ -127,6 +134,10 @@ def candle_scan(asset: str, market_phase: str) -> dict:
             "sources": [f"yfinance:{asset}:{interval}"],
             "degraded": True,
         }
+
+    # Hold out the most recent bars from analysis. The fill resolves the trade on
+    # exactly these bars, so the Researcher never sees the price action it trades.
+    df = df.iloc[:-HOLDOUT_BARS]
 
     close = df["Close"]
     last = float(close.iloc[-1])

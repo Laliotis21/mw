@@ -56,6 +56,18 @@ class Settings:
             "ALPACA_BASE_URL", "https://paper-api.alpaca.markets"
         )
 
+        # Binance (crypto paper trading). Spot Testnet by default — real exchange
+        # engine, fake balances, zero real money. Flip BINANCE_TESTNET=false to go
+        # live (real funds; you accept the risk). Keys from testnet.binance.vision.
+        self.BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
+        self.BINANCE_SECRET_KEY: str = os.getenv("BINANCE_SECRET_KEY", "")
+        self.BINANCE_TESTNET: bool = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
+        self.BINANCE_BASE_URL: str = os.getenv(
+            "BINANCE_BASE_URL",
+            "https://testnet.binance.vision" if self.BINANCE_TESTNET
+            else "https://api.binance.com",
+        )
+
         # Capital + risk.
         self.STARTING_CAPITAL: float = float(os.getenv("STARTING_CAPITAL", "1000"))
         self.MAX_RISK_PCT: float = float(os.getenv("MAX_RISK_PCT", "0.02"))
@@ -63,7 +75,7 @@ class Settings:
 
         # Models.
         self.ANTHROPIC_MODEL: str = os.getenv(
-            "ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"
+            "ANTHROPIC_MODEL", "claude-sonnet-4-6"
         )
         self.PERPLEXITY_MODEL: str = os.getenv("PERPLEXITY_MODEL", "sonar")
 
@@ -74,6 +86,8 @@ class Settings:
         self.RESEARCH_SOURCE: str = os.getenv("RESEARCH_SOURCE", "perplexity").lower()
         # FILL_SOURCE: how paper fills resolve.
         #   yfinance -> real price bars (free)  |  coinflip -> random TP/SL
+        #   binance  -> place real orders on Binance Spot Testnet (crypto only;
+        #               stocks fall back to yfinance). Bracket = market + OCO.
         self.FILL_SOURCE: str = os.getenv("FILL_SOURCE", "yfinance").lower()
         self.OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
         self.OLLAMA_BASE_URL: str = os.getenv(
@@ -104,6 +118,17 @@ class Settings:
 
 
 settings = Settings()
+
+
+def cap_quantity(qty: float, price: float, capital: float) -> float:
+    """
+    Clamp position size so notional (qty * price) never exceeds available
+    capital. Spot has no leverage — a risk-based qty from a tight stop can demand
+    more cash than the book holds, which the exchange rejects. Caps to all-in.
+    """
+    if price <= 0 or capital <= 0:
+        return qty
+    return min(qty, capital / price)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,9 +250,12 @@ class ExecutionTicket(BaseModel):
 
     asset: str
     action: Action
-    entry_price: float = Field(..., gt=0)
-    stop_loss: float = Field(..., gt=0)
-    take_profit: float = Field(..., gt=0)
+    # ge=0 (not gt=0): a HOLD ticket legitimately carries 0/echoed prices. The
+    # >0 requirement is enforced for BUY/SELL in _check_geometry instead, so a
+    # HOLD no longer fails validation and vanishes before it can be logged.
+    entry_price: float = Field(..., ge=0)
+    stop_loss: float = Field(..., ge=0)
+    take_profit: float = Field(..., ge=0)
     quantity: float = Field(..., ge=0, description="Units/shares. 0 == stand down.")
     risk_dollars: float = Field(..., ge=0, description="Capital at risk to the stop.")
     risk_pct: float = Field(..., ge=0)
@@ -257,6 +285,9 @@ class ExecutionTicket(BaseModel):
     def _check_geometry(self) -> "ExecutionTicket":
         if self.action == Action.HOLD:
             return self
+        # BUY/SELL must carry real positive prices (HOLD is exempt above).
+        if not (self.entry_price > 0 and self.stop_loss > 0 and self.take_profit > 0):
+            raise ValueError(f"{self.action} requires positive entry/stop/target.")
         if self.action == Action.BUY:
             # Long: stop below entry, target above.
             if not (self.stop_loss < self.entry_price < self.take_profit):

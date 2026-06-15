@@ -29,3 +29,6 @@ trade_log.json
 .DS_Store
 .idea/
 .vscode/
+
+# Local backups
+*.bak.json

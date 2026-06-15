@@ -33,7 +33,44 @@ from config import (
     logger,
     settings,
 )
-from execution import current_equity, execute_ticket, performance_summary
+from execution import (
+    current_equity,
+    execute_ticket,
+    log_usage,
+    performance_summary,
+    reconcile_open,
+)
+
+# Token usage from the most recent crew.kickoff(), stashed so the caller can
+# attribute it to the trade it produced (CrewAI aggregates per-crew usage).
+_LAST_USAGE: dict = {}
+
+
+def _usage_dict(token_usage) -> dict:
+    """Flatten CrewAI's UsageMetrics into a plain dict tagged with the model."""
+    if token_usage is None:
+        return {}
+    g = lambda a: int(getattr(token_usage, a, 0) or 0)  # noqa: E731
+    model = (
+        settings.ANTHROPIC_MODEL
+        if settings.LLM_PROVIDER == "anthropic"
+        else f"ollama/{settings.OLLAMA_MODEL}"
+    )
+    return {
+        "model": model,
+        "prompt_tokens": g("prompt_tokens"),
+        "completion_tokens": g("completion_tokens"),
+        "cached_tokens": g("cached_prompt_tokens"),
+        "total_tokens": g("total_tokens"),
+        "requests": g("successful_requests"),
+    }
+
+
+def pop_last_usage() -> dict:
+    """Return (and clear) the token usage from the last run_cycle/run_discovery."""
+    global _LAST_USAGE
+    u, _LAST_USAGE = _LAST_USAGE, {}
+    return u
 
 
 def run_cycle(
@@ -58,6 +95,9 @@ def run_cycle(
 
     logger.info("=== CYCLE START | asset=%s phase=%s ===", asset, market_phase)
 
+    global _LAST_USAGE
+    _LAST_USAGE = {}  # clear up front so a kickoff failure can't leak prior usage
+
     researcher = build_researcher()
     analyst = build_analyst()
     risk_officer = build_risk_officer()
@@ -80,6 +120,8 @@ def run_cycle(
     except Exception as exc:  # noqa: BLE001
         logger.error("Crew kickoff failed for %s: %s", asset, exc)
         return None
+
+    _LAST_USAGE = _usage_dict(getattr(result, "token_usage", None))
 
     # CrewAI exposes the last task's pydantic output here.
     ticket = getattr(result, "pydantic", None)
@@ -135,6 +177,9 @@ def run_discovery(
 
     logger.info("=== DISCOVERY START | phase=%s ===", market_phase)
 
+    global _LAST_USAGE
+    _LAST_USAGE = {}  # clear up front so a kickoff failure can't leak prior usage
+
     world_scout = build_world_scout()
     stock_scanner = build_stock_scanner()
     crypto_scanner = build_crypto_scanner()
@@ -161,6 +206,8 @@ def run_discovery(
     except Exception as exc:  # noqa: BLE001
         logger.error("Discovery crew failed: %s", exc)
         return None
+
+    _LAST_USAGE = _usage_dict(getattr(result, "token_usage", None))
 
     shortlist = getattr(result, "pydantic", None)
     if not isinstance(shortlist, OpportunityShortlist):
@@ -222,7 +269,20 @@ def main() -> int:
         action="store_true",
         help="Print performance summary and exit.",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Poll open Binance brackets, realize resolved P&L, then exit.",
+    )
     args = parser.parse_args()
+
+    if args.reconcile:
+        n = reconcile_open()
+        logger.info("Reconciled %d open Binance bracket(s).", n)
+        import json
+
+        print(json.dumps(performance_summary(), indent=2))
+        return 0
 
     if args.summary:
         import json
@@ -251,6 +311,10 @@ def main() -> int:
         settings.RESEARCH_SOURCE,
     )
 
+    # Realize any live broker brackets that closed since last run before we measure.
+    if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
+        reconcile_open()
+
     day_open_equity = current_equity()
     logger.info(
         "Run start | equity=$%.2f | risk cap/trade=$%.2f | daily stop=%.0f%%",
@@ -263,6 +327,7 @@ def main() -> int:
     # ranked shortlist; otherwise we trade exactly what the user passed.
     if args.discover:
         shortlist = run_discovery(args.phase)
+        log_usage(pop_last_usage())  # attribute scout tokens to the run ledger
         if shortlist is None or not shortlist.ideas:
             logger.warning("Discovery produced no tradable ideas — nothing to do.")
             assets = []
@@ -276,10 +341,12 @@ def main() -> int:
         if _circuit_breaker_tripped(day_open_equity):
             break
         ticket = run_cycle(asset, args.phase)
+        usage = pop_last_usage()
         if ticket is None:
+            log_usage(usage)  # crew still burned tokens even with no ticket
             logger.warning("Skipping execution for %s — no valid ticket.", asset)
             continue
-        execute_ticket(ticket, market_phase=args.phase)
+        execute_ticket(ticket, market_phase=args.phase, usage=usage)
 
     print("\n=== PERFORMANCE SUMMARY ===")
     import json

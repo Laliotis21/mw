@@ -1,16 +1,26 @@
 """
 dashboard.py
 ============
-Simple paper-trading control panel.
+Pro-trader control terminal for the multi-agent paper-trading bot.
 
-Plain and minimal on purpose: one screen, one button. No real money is ever
-involved — the bot decides with AI agents, then the trade is tested against REAL
-market prices (via yfinance) to see if it would have won or lost.
+A dense, dark "trading desk" layout: a live KPI strip, an equity curve, a
+trade blotter, open positions, and a real-time agent feed that streams the
+desk's reasoning as it works. Everything is PAPER — fills resolve against real
+prices (yfinance) or land on Binance Spot Testnet / Alpaca paper. No real money
+moves.
+
+Realtime: the KPI strip, equity curve and blotter live inside st.fragment
+blocks that auto-rerun every few seconds and re-read trade_log.json from disk,
+so fills written by a background bot run (or by the desk here) appear without a
+manual page refresh.
 
 Run:  streamlit run dashboard.py
+      (use the project venv: ./v/bin/python -m streamlit run dashboard.py)
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -18,29 +28,95 @@ import streamlit as st
 from config import MarketPhase, settings
 from execution import TRADE_LOG, performance_summary, _load_log  # noqa: PLC2701
 
-st.set_page_config(page_title="Trading Bot — Paper Mode", page_icon="📈", layout="centered")
+st.set_page_config(
+    page_title="ALPHA DESK — Trading Terminal",
+    page_icon="📟",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# A little polish for the phase pills.
+# --------------------------------------------------------------------------- #
+# Terminal theme — dark OLED, monospace numerics, dense panels.
+# --------------------------------------------------------------------------- #
+GREEN, RED, AMBER, BLUE, MUTED = "#16c784", "#ea3943", "#f5a623", "#3b82f6", "#6e7d92"
+
 st.markdown(
     """
     <style>
-    [data-testid="stSegmentedControl"] { gap: .35rem; }
+    @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
+
+    :root {
+        --bg:#0a0e14; --panel:#0f141d; --panel2:#111822; --border:#1c2735;
+        --text:#c9d6e3; --muted:#6e7d92; --green:#16c784; --red:#ea3943;
+        --amber:#f5a623; --blue:#3b82f6;
+    }
+    .stApp { background: var(--bg); }
+    html, body, [class*="css"] { font-family:'Fira Sans', sans-serif; color:var(--text); }
+    code, .mono, [data-testid="stMetricValue"] { font-family:'Fira Code', monospace !important; }
+
+    #MainMenu, footer, header { visibility:hidden; }
+    .block-container { padding-top:1rem; padding-bottom:2rem; max-width:1500px; }
+
+    .topbar {
+        display:flex; align-items:center; justify-content:space-between;
+        padding:.55rem .9rem; border:1px solid var(--border); border-radius:8px;
+        background:linear-gradient(90deg,#0d1420,#0a0e14); margin-bottom:.8rem;
+    }
+    .brand { font-family:'Fira Code',monospace; font-weight:700; letter-spacing:.18em;
+        font-size:1.05rem; color:#e9f0f7; }
+    .brand .dot { color:var(--amber); }
+    .chips { display:flex; gap:.4rem; align-items:center; }
+    .chip { font-family:'Fira Code',monospace; font-size:.68rem; font-weight:600;
+        padding:.2rem .55rem; border-radius:5px; border:1px solid var(--border);
+        background:#0c121b; color:var(--muted); letter-spacing:.06em; }
+    .chip.paper { color:var(--amber); border-color:rgba(245,166,35,.4); background:rgba(245,166,35,.08); }
+    .chip.live  { color:var(--red);   border-color:rgba(234,57,67,.4);  background:rgba(234,57,67,.08); }
+
+    /* Live pulse */
+    .livedot { display:inline-block; width:8px; height:8px; border-radius:50%;
+        background:var(--green); box-shadow:0 0 0 0 rgba(22,199,132,.6);
+        animation:pulse 1.6s infinite; margin-right:.4rem; vertical-align:middle; }
+    .livedot.off { background:var(--muted); animation:none; box-shadow:none; }
+    @keyframes pulse {
+        0%   { box-shadow:0 0 0 0 rgba(22,199,132,.55); }
+        70%  { box-shadow:0 0 0 7px rgba(22,199,132,0); }
+        100% { box-shadow:0 0 0 0 rgba(22,199,132,0); }
+    }
+    .chip.feed { color:var(--green); border-color:rgba(22,199,132,.35); background:rgba(22,199,132,.07); }
+
+    .kpi-row { display:grid; grid-template-columns:repeat(6,1fr); gap:.6rem; margin-bottom:.9rem; }
+    .kpi { border:1px solid var(--border); border-radius:8px; background:var(--panel); padding:.6rem .75rem; }
+    .kpi .lbl { font-size:.62rem; letter-spacing:.13em; text-transform:uppercase; color:var(--muted); }
+    .kpi .val { font-family:'Fira Code',monospace; font-size:1.32rem; font-weight:600; margin-top:.18rem; color:#eef4fa; }
+    .kpi .sub { font-family:'Fira Code',monospace; font-size:.72rem; margin-top:.1rem; }
+    .up { color:var(--green) !important; } .down { color:var(--red) !important; } .flat { color:var(--muted) !important; }
+
+    .phead { font-family:'Fira Code',monospace; font-size:.72rem; font-weight:700;
+        letter-spacing:.16em; text-transform:uppercase; color:var(--muted);
+        border-bottom:1px solid var(--border); padding-bottom:.35rem; margin:.2rem 0 .7rem; }
+    .phead .acc { color:var(--blue); }
+
+    .stButton>button {
+        font-family:'Fira Code',monospace !important; font-weight:700 !important;
+        letter-spacing:.08em; border-radius:7px !important; border:1px solid var(--green) !important;
+        background:rgba(22,199,132,.12) !important; color:var(--green) !important; transition:all .15s ease;
+    }
+    .stButton>button:hover { background:var(--green) !important; color:#04120c !important; box-shadow:0 0 14px rgba(22,199,132,.4); }
+
     [data-testid="stSegmentedControl"] button {
-        border-radius: 999px !important;
-        padding: .35rem 1rem !important;
-        font-weight: 600;
-        border: 1px solid rgba(250,250,250,.12) !important;
-        transition: all .15s ease;
+        border-radius:6px !important; font-family:'Fira Code',monospace !important;
+        font-size:.78rem !important; border:1px solid var(--border) !important;
     }
-    [data-testid="stSegmentedControl"] button[aria-checked="true"],
-    [data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] {
-        background: #ef4444 !important;
-        color: #fff !important;
-        border-color: #ef4444 !important;
+    [data-testid="stSegmentedControl"] button[aria-checked="true"] {
+        background:var(--blue) !important; color:#fff !important; border-color:var(--blue) !important;
     }
-    [data-testid="stSegmentedControl"] button:hover {
-        border-color: #ef4444 !important;
+    [data-testid="stTextInput"] input {
+        font-family:'Fira Code',monospace !important; background:#0c121b !important;
+        border:1px solid var(--border) !important; color:#eef4fa !important; letter-spacing:.05em;
     }
+    .stRadio [role="radiogroup"] { gap:.4rem; }
+    [data-testid="stDataFrame"] { border:1px solid var(--border); border-radius:8px; }
+    div[data-testid="stExpander"] { border:1px solid var(--border); border-radius:8px; background:var(--panel); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -48,228 +124,349 @@ st.markdown(
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Data helpers
 # --------------------------------------------------------------------------- #
-def trades_df() -> pd.DataFrame:
-    log = _load_log()
-    if not log["trades"]:
-        return pd.DataFrame()
-    return pd.DataFrame(log["trades"])
-
-
 def fmt_task(out) -> tuple[str, str]:
-    """(agent role, its decision text) from a CrewAI task output."""
     agent = str(getattr(out, "agent", "agent"))
     raw = getattr(out, "raw", None) or getattr(out, "summary", None) or str(out)
     raw = str(raw).strip()
     return agent, (raw if len(raw) <= 1500 else raw[:1500] + " …")
 
 
-# Friendly names for every agent — discovery scouts + decision desk.
 NICE_NAME = {
-    # Discovery crew
-    "Global Macro Scout": "🌍 Macro Scout — read the world",
-    "Equity Universe Scanner": "📈 Stock Scanner — found movers",
-    "Crypto Universe Scanner": "🪙 Crypto Scanner — found movers",
-    "Opportunity Ranker": "🎯 Ranker — picked the shortlist",
-    # Decision desk
-    "Lead Market Researcher (Data Scout)": "🔎 Researcher — read the market",
-    "Quantitative Signal Analyst": "📊 Analyst — picked a direction",
-    "Chief Risk Officer (Risk Manager)": "🛡️ Risk Manager — sized the trade",
+    "Global Macro Scout": "🌍 MACRO SCOUT",
+    "Equity Universe Scanner": "📈 EQUITY SCANNER",
+    "Crypto Universe Scanner": "🪙 CRYPTO SCANNER",
+    "Opportunity Ranker": "🎯 RANKER",
+    "Lead Market Researcher (Data Scout)": "🔎 RESEARCHER",
+    "Quantitative Signal Analyst": "📊 ANALYST",
+    "Chief Risk Officer (Risk Manager)": "🛡️ RISK DESK",
 }
+
+
+def topbar_html(live: bool) -> str:
+    fill = settings.FILL_SOURCE
+    mode_live = fill in ("binance", "alpaca", "live") and not (
+        fill == "binance" and settings.BINANCE_TESTNET
+    )
+    mode_chip = (
+        '<span class="chip live">LIVE $</span>' if mode_live
+        else '<span class="chip paper">PAPER</span>'
+    )
+    clock = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    dot = "livedot" if live else "livedot off"
+    feed_chip = (
+        f'<span class="chip feed"><span class="{dot}"></span>LIVE</span>' if live
+        else '<span class="chip"><span class="livedot off"></span>PAUSED</span>'
+    )
+    return f"""
+    <div class="topbar">
+      <div class="brand">ALPHA<span class="dot">·</span>DESK
+        <span style="color:#6e7d92;font-weight:400;font-size:.7rem;letter-spacing:.1em">MULTI-AGENT TERMINAL</span></div>
+      <div class="chips">
+        {feed_chip}
+        {mode_chip}
+        <span class="chip">LLM {settings.LLM_PROVIDER.upper()}</span>
+        <span class="chip">FILL {fill.upper()}</span>
+        <span class="chip">{clock}</span>
+      </div>
+    </div>
+    """
+
+
+def kpi_html(perf: dict, df: pd.DataFrame) -> str:
+    ret, pnl = perf["return_pct"], perf["net_pnl"]
+    ret_cls = "up" if ret > 0 else ("down" if ret < 0 else "flat")
+    pnl_cls = "up" if pnl > 0 else ("down" if pnl < 0 else "flat")
+    wr = perf["win_rate_pct"]
+    wr_cls = "up" if wr >= 50 and perf["resolved_trades"] else ("down" if perf["resolved_trades"] else "flat")
+    open_n = int((df["result"] == "open").sum()) if not df.empty and "result" in df else 0
+    cells = [
+        ("EQUITY", f"${perf['current_equity']:,.2f}", f"{ret:+.2f}%", ret_cls),
+        ("NET P&L", f"${pnl:,.2f}", "realized", pnl_cls),
+        ("WIN RATE", f"{wr:.0f}%", f"{perf['resolved_trades']} resolved", wr_cls),
+        ("TRADES", f"{perf['total_trades']}", f"{open_n} open", "flat"),
+        ("MAX DD", f"${perf['max_drawdown_dollars']:,.2f}", f"-{perf['max_drawdown_pct']:.1f}%",
+         "down" if perf["max_drawdown_dollars"] > 0 else "flat"),
+        ("RISK/TRADE", f"${settings.MAX_RISK_DOLLARS:,.0f}", f"{settings.MAX_RISK_PCT*100:.0f}% cap", "flat"),
+    ]
+    body = "".join(
+        f'<div class="kpi"><div class="lbl">{lbl}</div>'
+        f'<div class="val">{val}</div><div class="sub {cls}">{sub}</div></div>'
+        for lbl, val, sub, cls in cells
+    )
+    return f'<div class="kpi-row">{body}</div>'
+
+
+def ledger_html(meta: dict) -> str:
+    """Compact API-spend ledger from the log's running token totals."""
+    u = meta.get("usage")
+    if not u:
+        return ('<div style="font-family:Fira Code,monospace;font-size:.68rem;color:#6e7d92;'
+                'margin:-.4rem 0 .8rem">API SPEND  —  no LLM calls logged yet '
+                '(free local model = $0; switch LLM_PROVIDER=anthropic for real $).</div>')
+    spend = u.get("cost_usd", 0.0)
+    toks = u.get("total_tokens") or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
+    reqs = u.get("requests", 0)
+    model = (u.get("model") or "").split("/")[-1]
+    paid = spend > 0
+    spend_txt = f"${spend:,.4f}" if paid else "$0.00 (free local)"
+    cells = [
+        ("API SPEND", spend_txt),
+        ("TOKENS", f"{toks:,}"),
+        ("LLM CALLS", f"{reqs:,}"),
+        ("MODEL", model or "—"),
+    ]
+    inner = "   ·   ".join(
+        f'<span style="color:#6e7d92">{k}</span> '
+        f'<span style="color:{"#f5a623" if paid and k=="API SPEND" else "#c9d6e3"}">{v}</span>'
+        for k, v in cells
+    )
+    return (f'<div style="font-family:Fira Code,monospace;font-size:.7rem;'
+            f'border:1px solid #1c2735;border-radius:6px;padding:.4rem .7rem;'
+            f'margin:-.3rem 0 .9rem;background:#0c121b">⛁ {inner}</div>')
 
 
 def _show_trade_result(asset: str, ticket, record) -> None:
-    """Render one executed ticket as a friendly success/error/info box."""
     action = ticket.action.value
     if action == "HOLD" or record["quantity"] == 0:
-        st.info(f"🤚 Agents decided to **HOLD {asset}** — no trade taken (no clear edge).")
+        st.info(f"🤚 **HOLD {asset}** — desk stood down, no clear edge.")
         return
-    verdict = {
-        "take_profit": "✅ hit the profit target",
-        "stop_loss": "❌ hit the stop loss",
-        "markout": "➖ closed flat at end of window",
-    }.get(record["result"], record["result"])
+    if record["result"] == "open":
+        st.warning(
+            f"📤 **{action} {record['quantity']} {asset}** @ ${record['entry_price']} "
+            f"— bracket LIVE on broker ({record.get('fill_source','')}). Outcome pending."
+        )
+        return
+    verdict = {"take_profit": "✅ TP HIT", "stop_loss": "❌ STOP HIT", "markout": "➖ MARKED OUT"}.get(
+        record["result"], record["result"])
     pnl = record["pnl"]
     box = st.success if pnl > 0 else (st.error if pnl < 0 else st.info)
-    box(
-        f"**{action} {record['quantity']} {asset}** at ${record['entry_price']} "
-        f"→ {verdict}. Profit/loss: **${pnl:,.2f}** (tested on real prices)."
-    )
+    box(f"**{action} {record['quantity']} {asset}** @ ${record['entry_price']} → {verdict} · "
+        f"P&L **${pnl:,.2f}** (real prices)")
+
+
+def render_equity_curve(df: pd.DataFrame, start: float) -> None:
+    if df.empty:
+        st.caption("No trades yet — the curve plots once the desk executes.")
+        return
+    curve = df[["equity_after"]].copy()
+    curve.index = range(1, len(curve) + 1)
+    curve = pd.concat([pd.DataFrame({"equity_after": [start]}, index=[0]), curve])
+    curve = curve.reset_index().rename(columns={"index": "trade", "equity_after": "equity"})
+    line = GREEN if curve["equity"].iloc[-1] >= start else RED
+    try:
+        import altair as alt
+        base = alt.Chart(curve)
+        area = base.mark_area(
+            line={"color": line, "strokeWidth": 2},
+            color=alt.Gradient(gradient="linear", stops=[
+                alt.GradientStop(color=line, offset=1),
+                alt.GradientStop(color="#0a0e14", offset=0)], x1=1, x2=1, y1=1, y2=0),
+            opacity=0.18,
+        ).encode(
+            x=alt.X("trade:Q", title=None, axis=alt.Axis(grid=False, labelColor=MUTED, tickColor=MUTED, domainColor="#1c2735")),
+            y=alt.Y("equity:Q", title=None, scale=alt.Scale(zero=False),
+                    axis=alt.Axis(grid=True, gridColor="#141c27", labelColor=MUTED, tickColor=MUTED, domainColor="#1c2735", format="$,.0f")),
+            tooltip=[alt.Tooltip("trade:Q", title="Trade #"), alt.Tooltip("equity:Q", title="Equity", format="$,.2f")],
+        )
+        rule = alt.Chart(pd.DataFrame({"y": [start]})).mark_rule(
+            color=MUTED, strokeDash=[4, 4], opacity=0.6).encode(y="y:Q")
+        chart = (area + rule).properties(height=230).configure_view(strokeWidth=0, fill="#0a0e14")
+        st.altair_chart(chart, width="stretch")
+    except Exception:  # noqa: BLE001
+        st.line_chart(curve.set_index("trade")["equity"], height=230)
+
+
+def _fmt_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a compact 'Time' column (UTC) parsed from timestamp_utc."""
+    df = df.copy()
+    if "timestamp_utc" in df:
+        ts = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
+        df["Time"] = ts.dt.strftime("%m-%d %H:%M:%S").fillna("—")
+    return df
+
+
+def render_open_positions(df: pd.DataFrame) -> None:
+    if df.empty or "result" not in df or not (df["result"] == "open").any():
+        return
+    st.markdown('<div class="phead"><span class="acc">▎</span>OPEN POSITIONS</div>', unsafe_allow_html=True)
+    op = _fmt_time(df[df["result"] == "open"]).rename(columns={
+        "asset": "Ticker", "action": "Side", "entry_price": "Entry", "stop_loss": "Stop",
+        "take_profit": "Target", "quantity": "Qty", "fill_source": "Venue"})
+    cols = [c for c in ["Time", "Ticker", "Side", "Qty", "Entry", "Stop", "Target", "Venue"] if c in op]
+    st.dataframe(op[cols].iloc[::-1], width="stretch", hide_index=True)
+
+
+def render_blotter(df: pd.DataFrame) -> None:
+    st.markdown('<div class="phead"><span class="acc">▎</span>TRADE BLOTTER</div>', unsafe_allow_html=True)
+    if df.empty:
+        st.caption("Blotter empty.")
+        return
+    nice = _fmt_time(df).rename(columns={
+        "asset": "Ticker", "action": "Side", "entry_price": "Entry", "exit_price": "Exit",
+        "result": "Result", "pnl": "P&L", "equity_after": "Equity", "llm_cost_usd": "LLM $"})
+    cols = [c for c in ["Time", "Ticker", "Side", "Entry", "Exit", "Result", "P&L", "Equity", "LLM $"] if c in nice]
+    blotter = nice[cols].iloc[::-1].head(25)
+
+    def _pnl_color(v):
+        if pd.isna(v):
+            return ""
+        return f"color:{GREEN}" if v > 0 else (f"color:{RED}" if v < 0 else f"color:{MUTED}")
+
+    styler = blotter.style.map(_pnl_color, subset=["P&L"]) if "P&L" in blotter else blotter.style
+    fmts = {c: "${:,.2f}" for c in ("Entry", "Exit", "Equity") if c in blotter}
+    if "P&L" in blotter:
+        fmts["P&L"] = "${:+,.2f}"
+    if "LLM $" in blotter:
+        fmts["LLM $"] = "${:,.4f}"
+    st.dataframe(styler.format(fmts, na_rep="—"), width="stretch", hide_index=True, height=360)
 
 
 # --------------------------------------------------------------------------- #
-# Header + balance
+# Realtime controls — drive the fragments' auto-rerun interval.
 # --------------------------------------------------------------------------- #
-st.title("📈 Trading Bot")
-st.caption("Paper mode — fake money, real prices. Nothing is actually bought or sold.")
+cc = st.columns([5, 1.1, 1.4])
+with cc[1]:
+    live = st.toggle("🔴 Live", value=True, help="Auto-refresh KPIs, curve & blotter from disk.")
+with cc[2]:
+    interval = st.selectbox("Refresh", [2, 3, 5, 10], index=1,
+                            format_func=lambda s: f"{s}s", label_visibility="collapsed",
+                            help="Auto-refresh interval")
+every = float(interval) if live else None
 
-perf = performance_summary()
-c1, c2, c3 = st.columns(3)
-c1.metric("💰 Balance", f"${perf['current_equity']:,.2f}", f"{perf['return_pct']:+.2f}%")
-c2.metric("📈 Total profit/loss", f"${perf['net_pnl']:,.2f}")
-c3.metric("🔁 Trades made", perf["total_trades"])
-
-st.divider()
 
 # --------------------------------------------------------------------------- #
-# The action: either auto-discover movers, or pick one ticker — then trade.
+# Fragment 1: top status bar + KPI strip (full width, auto-rerun).
 # --------------------------------------------------------------------------- #
-st.subheader("Run a trade")
+@st.fragment(run_every=every)
+def header_kpi() -> None:
+    log = _load_log()
+    df = pd.DataFrame(log["trades"]) if log["trades"] else pd.DataFrame()
+    st.markdown(topbar_html(live), unsafe_allow_html=True)
+    st.markdown(kpi_html(performance_summary(), df), unsafe_allow_html=True)
+    st.markdown(ledger_html(log["meta"]), unsafe_allow_html=True)
 
-mode = st.radio(
-    "How should we pick what to trade?",
-    ["🔍 Auto-discover movers", "✍️ Pick a ticker"],
-    horizontal=True,
-)
-discover = mode.startswith("🔍")
 
-if discover:
-    st.caption(
-        f"4 scout agents scan live stock + crypto movers and the macro backdrop, "
-        f"then the desk trades the top {settings.MAX_CANDIDATES}."
-    )
-    asset = ""
-else:
-    asset = st.text_input("Stock / crypto ticker", value="AAPL").strip().upper()
+header_kpi()
 
-# Market-phase picker — pill segmented control instead of a cramped dropdown.
-PHASE_LABELS = {
-    "pre_market": "🌅 Pre-market",
-    "open": "🔔 Open",
-    "mid_day": "☀️ Mid-day",
-    "close": "🌆 Close",
-}
-_phase_values = [p.value for p in MarketPhase]
-st.markdown("**🕑 Time of day**")
-_picked = st.segmented_control(
-    "Time of day",
-    options=_phase_values,
-    format_func=lambda v: PHASE_LABELS.get(v, v),
-    default="open",
-    label_visibility="collapsed",
-)
-phase = _picked or "open"
+# --------------------------------------------------------------------------- #
+# Desk: order desk + agent feed (left, interactive) | live market (right).
+# --------------------------------------------------------------------------- #
+left, right = st.columns([1, 1.55], gap="medium")
 
-btn_label = "🛰️  Scout the market & trade" if discover else "▶️  Let the AI agents trade"
-run = st.button(btn_label, type="primary", width="stretch")
+with left:
+    st.markdown('<div class="phead"><span class="acc">▎</span>ORDER DESK</div>', unsafe_allow_html=True)
+    mode = st.radio("Selection", ["🔍 Auto-discover movers", "✍️ Pick a ticker"],
+                    horizontal=True, label_visibility="collapsed")
+    discover = mode.startswith("🔍")
+    if discover:
+        st.caption(f"4 scouts scan live stock + crypto movers & macro, then the desk trades the top {settings.MAX_CANDIDATES}.")
+        asset = ""
+    else:
+        asset = st.text_input("Ticker", value="AAPL", label_visibility="collapsed",
+                              placeholder="AAPL / BTC-USD").strip().upper()
+    PHASE_LABELS = {"pre_market": "🌅 PRE", "open": "🔔 OPEN", "mid_day": "☀️ MID", "close": "🌆 CLOSE"}
+    st.markdown('<div style="font-size:.62rem;letter-spacing:.13em;color:#6e7d92;text-transform:uppercase;margin-top:.4rem">Session</div>', unsafe_allow_html=True)
+    _picked = st.segmented_control("Session", options=[p.value for p in MarketPhase],
+                                   format_func=lambda v: PHASE_LABELS.get(v, v),
+                                   default="open", label_visibility="collapsed")
+    phase = _picked or "open"
+    btn_label = "▶  SCOUT & TRADE" if discover else "▶  EXECUTE CYCLE"
+    run = st.button(btn_label, type="primary", width="stretch")
 
-# Live area for this run.
-feed = st.container()
+    st.markdown('<div class="phead" style="margin-top:1rem"><span class="acc">▎</span>AGENT FEED</div>', unsafe_allow_html=True)
+    feed = st.container(height=420, border=False)
+    if not run:
+        feed.caption("Idle. Press EXECUTE to stream the desk's reasoning here in real time.")
 
 
 def feed_task(out) -> None:
-    """Stream one agent's output into the live feed."""
     role, text = fmt_task(out)
     with feed:
         st.markdown(f"**{NICE_NAME.get(role, role)}**")
         st.code(text, language="json")
 
 
+with right:
+    @st.fragment(run_every=every)
+    def market_panel() -> None:
+        log = _load_log()
+        df = pd.DataFrame(log["trades"]) if log["trades"] else pd.DataFrame()
+        start = log["meta"]["starting_capital"]
+        st.markdown('<div class="phead"><span class="acc">▎</span>EQUITY CURVE</div>', unsafe_allow_html=True)
+        render_equity_curve(df, start)
+        render_open_positions(df)
+        render_blotter(df)
+
+    market_panel()
+
+# --------------------------------------------------------------------------- #
+# Run a cycle — stream agents into the left feed, results below the curve.
+# Fragments pick up the new fills on their next tick (no manual refresh).
+# --------------------------------------------------------------------------- #
 if run and (discover or asset):
-    # Force the free local setup (no paid keys, real prices for the result).
     settings.LLM_PROVIDER = "ollama"
     settings.RESEARCH_SOURCE = "candles"
     settings.FILL_SOURCE = "yfinance"
 
-    from execution import execute_ticket
-    from main import run_cycle, run_discovery
+    from execution import execute_ticket, log_usage
+    from main import pop_last_usage, run_cycle, run_discovery
 
+    results = right.container()
     try:
         if discover:
-            # 1) Discovery crew → ranked shortlist.
-            with st.status("🛰️ Scouts scanning the market…", expanded=True):
-                shortlist = run_discovery(phase, task_callback=feed_task)
-
+            with feed:
+                with st.status("🛰️ Scouts scanning the tape…", expanded=True):
+                    shortlist = run_discovery(phase, task_callback=feed_task)
+            log_usage(pop_last_usage())  # log scout-crew tokens to the ledger
             if shortlist is None or not shortlist.ideas:
-                st.error("Scouts found no tradable ideas right now. Try another phase.")
+                results.error("Scouts found no tradable ideas right now. Try another session.")
             else:
-                st.markdown(
-                    f"**🎯 Shortlist** — macro tilt: `{shortlist.macro_bias.value}` "
-                    f"({shortlist.macro_score:+.2f}). "
-                    f"Themes: {', '.join(shortlist.themes) or '—'}"
-                )
-                st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Ticker": i.asset,
-                                "Class": i.asset_class.value,
-                                "Score": i.raw_score,
-                                "Move %": i.change_pct,
-                                "Why": i.reason,
-                            }
-                            for i in shortlist.ideas
-                        ]
-                    ),
-                    width="stretch",
-                    hide_index=True,
-                )
-
-                # 2) Trade each shortlisted name through the desk.
-                ideas = shortlist.ideas[: settings.MAX_CANDIDATES]
-                for n, idea in enumerate(ideas, 1):
-                    with st.status(f"📊 Desk trading {idea.asset} ({n}/{len(ideas)})…", expanded=True):
-                        ticket = run_cycle(idea.asset, phase, task_callback=feed_task)
+                results.markdown(
+                    f'<div class="phead" style="margin-top:1rem"><span class="acc">▎</span>SHORTLIST · '
+                    f'macro {shortlist.macro_bias.value} ({shortlist.macro_score:+.2f})</div>',
+                    unsafe_allow_html=True)
+                results.dataframe(pd.DataFrame([
+                    {"Ticker": i.asset, "Class": i.asset_class.value, "Score": i.raw_score,
+                     "Move %": i.change_pct, "Why": i.reason} for i in shortlist.ideas]),
+                    width="stretch", hide_index=True)
+                for n, idea in enumerate(shortlist.ideas[: settings.MAX_CANDIDATES], 1):
+                    ideas_n = min(len(shortlist.ideas), settings.MAX_CANDIDATES)
+                    with feed:
+                        with st.status(f"📊 Desk trading {idea.asset} ({n}/{ideas_n})…", expanded=True):
+                            ticket = run_cycle(idea.asset, phase, task_callback=feed_task)
+                    cycle_usage = pop_last_usage()
                     if ticket is None:
-                        st.warning(f"No valid decision for {idea.asset} — skipped.")
+                        log_usage(cycle_usage)
+                        results.warning(f"No valid decision for {idea.asset} — skipped.")
                         continue
-                    record = execute_ticket(ticket, market_phase=phase)
-                    _show_trade_result(idea.asset, ticket, record)
+                    record = execute_ticket(ticket, market_phase=phase, usage=cycle_usage)
+                    with results:
+                        _show_trade_result(idea.asset, ticket, record)
         else:
-            # Single hand-picked ticker.
-            with st.status(f"📊 Agents trading {asset}…", expanded=True):
-                ticket = run_cycle(asset, phase, task_callback=feed_task)
+            with feed:
+                with st.status(f"📊 Desk trading {asset}…", expanded=True):
+                    ticket = run_cycle(asset, phase, task_callback=feed_task)
+            cycle_usage = pop_last_usage()
             if ticket is None:
-                st.error("The agents could not produce a valid decision. Try again.")
+                log_usage(cycle_usage)
+                results.error("The desk could not produce a valid decision. Try again.")
             else:
-                record = execute_ticket(ticket, market_phase=phase)
-                _show_trade_result(asset, ticket, record)
+                record = execute_ticket(ticket, market_phase=phase, usage=cycle_usage)
+                with results:
+                    _show_trade_result(asset, ticket, record)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Something went wrong: {exc}")
+        results.error(f"Run failed: {exc}")
 elif run and not discover and not asset:
-    st.warning("Type a ticker first (e.g. AAPL).")
-
-st.divider()
+    st.warning("Type a ticker first (e.g. AAPL or BTC-USD).")
 
 # --------------------------------------------------------------------------- #
-# Balance over time + recent trades
+# Reset, tucked at the bottom.
 # --------------------------------------------------------------------------- #
-df = trades_df()
-if df.empty:
-    st.info("No trades yet. Pick a ticker above and press the button.")
-else:
-    st.subheader("Balance over time")
-    curve = df[["equity_after"]].copy()
-    curve.index = range(1, len(curve) + 1)
-    start = _load_log()["meta"]["starting_capital"]
-    curve = pd.concat([pd.DataFrame({"equity_after": [start]}, index=[0]), curve])
-    st.line_chart(curve, height=240)
-
-    st.subheader("Recent trades")
-    nice = df.copy()
-    nice = nice.rename(
-        columns={
-            "asset": "Ticker",
-            "action": "Action",
-            "entry_price": "Entry",
-            "result": "Result",
-            "pnl": "P/L ($)",
-            "equity_after": "Balance",
-        }
-    )
-    cols = [c for c in ["Ticker", "Action", "Entry", "Result", "P/L ($)", "Balance"] if c in nice]
-    st.dataframe(
-        nice[cols].iloc[::-1].head(15),
-        width="stretch",
-        hide_index=True,
-    )
-
-# --------------------------------------------------------------------------- #
-# Small reset, tucked at the bottom.
-# --------------------------------------------------------------------------- #
-with st.expander("Reset"):
-    if st.button("Clear all trades & reset balance to $1,000"):
+with st.expander("⚙ Desk controls"):
+    st.caption(f"Risk cap ${settings.MAX_RISK_DOLLARS:,.0f}/trade · daily stop {settings.DAILY_MAX_LOSS_PCT*100:.0f}% · starting capital ${settings.STARTING_CAPITAL:,.0f}")
+    if st.button("Flatten book — clear all trades & reset balance"):
         if TRADE_LOG.exists():
             TRADE_LOG.unlink()
         st.rerun()
