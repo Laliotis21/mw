@@ -120,13 +120,15 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     hi20, lo20, mom, bars = ind["hi20"], ind["lo20"], ind["mom"], ind["bars"]
     sd = ind["stop_dist"]
     sd_cat = max(sd, last * 0.02)  # wider stop for volatile catalyst moves
+    # Spot crypto can't be shorted — treat crypto as long-only (no SELL signals).
+    crypto = asset.upper().endswith(("-USD", "-USDT", "USDT"))
 
     # Catalyst-momentum: fresh strong news aligned with price — works on any
     # history depth, so it catches IPOs/news plays before the SMAs are valid.
     if catalyst and ns >= 0.5 and mom > 0:
         why = f"BUY (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
         return _mk(asset, Action.BUY, last, last - sd_cat, sd_cat, 0.6 + 0.3 * ns, why, news)
-    if catalyst and ns <= -0.5 and mom < 0:
+    if catalyst and ns <= -0.5 and mom < 0 and not crypto:
         why = f"SELL (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
         return _mk(asset, Action.SELL, last, last + sd_cat, sd_cat, 0.6 + 0.3 * abs(ns), why, news)
 
@@ -145,6 +147,12 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     rsi_short_ok = 28.0 <= rsi <= 55.0
     buy = (up_trend and rsi_long_ok) or (breakout and rsi < 75 and mom > 0)
     sell = (down_trend and rsi_short_ok) or (breakdown and rsi > 25 and mom < 0)
+
+    if crypto and sell and not buy:  # spot crypto is long-only — never short
+        return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.3,
+                           rationale=(f"HOLD: bearish technicals on {asset} but spot crypto "
+                                      f"is long-only (no short). close {last:.2f}, RSI {rsi:.0f}."),
+                           time_horizon="swing")
 
     if buy and not sell:
         if ns <= -0.4:  # bad fresh news on a long — veto
