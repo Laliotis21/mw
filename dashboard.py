@@ -153,9 +153,9 @@ NICE_NAME = {
 
 def topbar_html(live: bool) -> str:
     fill = settings.FILL_SOURCE
-    mode_live = fill in ("binance", "alpaca", "live") and not (
-        fill == "binance" and settings.BINANCE_TESTNET
-    )
+    # Real money only when crypto routes to a NON-testnet Binance. Alpaca here is
+    # always paper, and Binance testnet is fake — both read as PAPER.
+    mode_live = fill in ("binance", "live") and not settings.BINANCE_TESTNET
     mode_chip = (
         '<span class="chip live">LIVE $</span>' if mode_live
         else '<span class="chip paper">PAPER</span>'

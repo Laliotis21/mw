@@ -71,6 +71,9 @@ def _apply_close(t: dict, log: dict) -> Optional[dict]:
     if src.startswith("alpaca"):
         import alpaca_broker
         out = alpaca_broker.close_position(t)
+    elif src.startswith("binance"):
+        import binance_broker
+        out = binance_broker.close_position(t)
     else:
         logger.warning("Manual close not supported for venue %s.", src)
         return None

@@ -192,6 +192,46 @@ def place_bracket(ticket: ExecutionTicket) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Manual close — cancel the OCO and market-sell the spot holding now.
+# --------------------------------------------------------------------------- #
+def close_position(record: dict) -> Optional[Tuple[str, float, float]]:
+    """
+    Close an open spot bracket on demand: cancel the resting OCO, then market-
+    sell the held base qty. Returns ('manual_close', exit_price, pnl). None on
+    error. (Spot is long-only, so closing a BUY is always a SELL.)
+    """
+    symbol = record.get("binance_symbol")
+    list_id = record.get("binance_order_list_id")
+    if not symbol:
+        return None
+    try:
+        # 1) Cancel the resting OCO (ignore if already gone).
+        if list_id not in (None, -1):
+            try:
+                _signed("DELETE", "/api/v3/orderList",
+                        {"symbol": symbol, "orderListId": list_id})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Binance OCO cancel %s: %s", symbol, exc)
+        # 2) Market-sell the held quantity (snap to lot size).
+        flt = _filters(symbol)
+        qty_str = _snap(float(record["quantity"]), flt["step"])
+        if Decimal(qty_str) <= 0:
+            return ("canceled", 0.0, 0.0)
+        sell = _signed("POST", "/api/v3/order",
+                       {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": qty_str})
+        fills = sell.get("fills") or []
+        got = sum(float(f["qty"]) for f in fills) or float(qty_str)
+        spent = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+        entry = float(record["entry_price"])
+        exit_price = spent / got if got and spent else entry
+        pnl = round((exit_price - entry) * got, 2)
+        return ("manual_close", round(exit_price, 2), pnl)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Binance close_position failed for %s: %s", symbol, exc)
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Reconcile an open bracket — poll the OCO, realize P&L when it resolves.
 # --------------------------------------------------------------------------- #
 def reconcile_bracket(record: dict) -> Optional[Tuple[str, float, float]]:
