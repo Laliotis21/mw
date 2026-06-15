@@ -108,13 +108,15 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
     trigger a momentum entry on thin history (new listings the SMAs can't see).
     """
     ind = _indicators(asset)
-    news = _news(asset)
-    ns, catalyst = news.get("score", 0.0), news.get("catalyst", False)
-
     if ind is None:
+        # No candle data → can't size anyway. Skip the news call (saves a fetch/
+        # LLM hit on dead tickers).
         return TradeSignal(asset=asset, action=Action.HOLD, confidence=0.0,
                            rationale="No usable candle data — stand down.",
                            time_horizon="swing")
+
+    news = _news(asset)
+    ns, catalyst = news.get("score", 0.0), news.get("catalyst", False)
 
     last, sma20, sma50, rsi = ind["last"], ind["sma20"], ind["sma50"], ind["rsi"]
     hi20, lo20, mom, bars = ind["hi20"], ind["lo20"], ind["mom"], ind["bars"]
@@ -125,10 +127,10 @@ def rules_signal(asset: str, market_phase: str) -> TradeSignal:
 
     # Catalyst-momentum: fresh strong news aligned with price — works on any
     # history depth, so it catches IPOs/news plays before the SMAs are valid.
-    if catalyst and ns >= 0.5 and mom > 0:
+    if catalyst and ns >= 0.5 and mom >= 1.0:
         why = f"BUY (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
         return _mk(asset, Action.BUY, last, last - sd_cat, sd_cat, 0.6 + 0.3 * ns, why, news)
-    if catalyst and ns <= -0.5 and mom < 0 and not crypto:
+    if catalyst and ns <= -0.5 and mom <= -1.0 and not crypto:
         why = f"SELL (catalyst momentum): fresh news {ns:+.2f}, mom {mom:+.1f}%, close {last:.2f}, {bars} bars"
         return _mk(asset, Action.SELL, last, last + sd_cat, sd_cat, 0.6 + 0.3 * abs(ns), why, news)
 

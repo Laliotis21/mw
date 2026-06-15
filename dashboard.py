@@ -456,10 +456,14 @@ def feed_task(out) -> None:
 with right:
     @st.fragment(run_every=every)
     def market_panel() -> None:
-        # Auto-notify on close: poll the broker each tick ONLY while positions are
-        # open (no API spam when flat). A settled TP/SL pops a toast immediately.
+        # Auto-notify on close: poll the broker ONLY while positions are open and
+        # at most every 15s (decoupled from the faster view refresh) — settled
+        # TP/SL pops a toast without hammering the broker API.
         if settings.FILL_SOURCE in ("binance", "alpaca", "live") and open_positions_count():
-            _toast_closed(reconcile_open())
+            import time as _t
+            if _t.time() - st.session_state.get("_last_reconcile", 0.0) >= 15:
+                st.session_state["_last_reconcile"] = _t.time()
+                _toast_closed(reconcile_open())
         log = _load_log()
         df = pd.DataFrame(log["trades"]) if log["trades"] else pd.DataFrame()
         start = log["meta"]["starting_capital"]
