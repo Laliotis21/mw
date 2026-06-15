@@ -324,17 +324,23 @@ def execute_ticket(
     return record
 
 
-def reconcile_open() -> int:
+def open_positions_count() -> int:
+    """How many broker brackets are still open (awaiting TP/SL). Cheap, no API."""
+    return sum(1 for t in _load_log()["trades"] if t.get("result") == "open")
+
+
+def reconcile_open() -> list[dict]:
     """
-    Resolve any open Binance brackets whose OCO has finished. Updates each
-    trade's result/exit/pnl in place and rolls realized P&L into equity.
-    Returns the count of trades newly resolved. Safe to call repeatedly.
+    Resolve any open broker brackets whose OCO has finished. Updates each trade's
+    result/exit/pnl in place and rolls realized P&L into equity. Returns a list
+    of the newly-CLOSED trades [{asset, result, pnl}] so callers can notify the
+    user. Safe to call repeatedly (no-op when nothing has resolved).
     """
     import binance_broker
     import alpaca_broker
 
     log = _load_log()
-    resolved = 0
+    closed: list[dict] = []
     for t in log["trades"]:
         if t.get("result") != "open":
             continue
@@ -354,12 +360,12 @@ def reconcile_open() -> int:
         new_equity = round(log["meta"]["equity"] + pnl, 2)
         t["equity_after"] = new_equity
         log["meta"]["equity"] = new_equity
-        resolved += 1
+        closed.append({"asset": t["asset"], "result": result, "pnl": pnl})
         logger.info("RECONCILED %s %s pnl=$%.2f equity=$%.2f",
                     t["asset"], result, pnl, new_equity)
-    if resolved:
+    if closed:
         _save_log(log)
-    return resolved
+    return closed
 
 
 def performance_summary() -> dict:

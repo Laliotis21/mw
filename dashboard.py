@@ -26,7 +26,13 @@ import pandas as pd
 import streamlit as st
 
 from config import MarketPhase, current_market_phase, settings
-from execution import TRADE_LOG, performance_summary, _load_log  # noqa: PLC2701
+from execution import (  # noqa: PLC2701
+    TRADE_LOG,
+    _load_log,
+    open_positions_count,
+    performance_summary,
+    reconcile_open,
+)
 
 st.set_page_config(
     page_title="ALPHA DESK — Trading Terminal",
@@ -232,6 +238,14 @@ def ledger_html(meta: dict) -> str:
     return (f'<div style="font-family:Fira Code,monospace;font-size:.7rem;'
             f'border:1px solid #1c2735;border-radius:6px;padding:.4rem .7rem;'
             f'margin:-.3rem 0 .9rem;background:#0c121b">⛁ {inner}</div>')
+
+
+def _toast_closed(closed: list[dict]) -> None:
+    """Pop a toast for each broker position that just settled (TP/SL)."""
+    for c in closed or []:
+        pnl = c.get("pnl", 0.0)
+        icon = "✅" if c.get("result") == "take_profit" else ("❌" if c.get("result") == "stop_loss" else "➖")
+        st.toast(f"{icon} {c.get('asset')} closed — {c.get('result')} · P&L ${pnl:+,.2f}", icon=icon)
 
 
 def last_run_html(meta: dict) -> str:
@@ -442,6 +456,10 @@ def feed_task(out) -> None:
 with right:
     @st.fragment(run_every=every)
     def market_panel() -> None:
+        # Auto-notify on close: poll the broker each tick ONLY while positions are
+        # open (no API spam when flat). A settled TP/SL pops a toast immediately.
+        if settings.FILL_SOURCE in ("binance", "alpaca", "live") and open_positions_count():
+            _toast_closed(reconcile_open())
         log = _load_log()
         df = pd.DataFrame(log["trades"]) if log["trades"] else pd.DataFrame()
         start = log["meta"]["starting_capital"]
@@ -473,9 +491,7 @@ if run and (discover or asset):
 
     # Settle any broker brackets that closed since last run before placing new ones.
     if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
-        n = reconcile_open()
-        if n:
-            right.info(f"Reconciled {n} closed broker position(s).")
+        _toast_closed(reconcile_open())
 
     results = right.container()
     cost0 = _load_log()["meta"].get("usage", {}).get("cost_usd", 0.0)
@@ -552,9 +568,9 @@ with st.expander("⚙ Desk controls"):
     st.caption(f"Risk cap ${settings.MAX_RISK_DOLLARS:,.0f}/trade · daily stop {settings.DAILY_MAX_LOSS_PCT*100:.0f}% · starting capital ${settings.STARTING_CAPITAL:,.0f} · fills via {settings.FILL_SOURCE.upper()}")
     if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
         if st.button("🔄 Reconcile open positions (poll broker, settle TP/SL)"):
-            from execution import reconcile_open
-            n = reconcile_open()
-            st.success(f"Settled {n} closed position(s)." if n else "No positions resolved yet.")
+            closed = reconcile_open()
+            _toast_closed(closed)
+            st.success(f"Settled {len(closed)} closed position(s)." if closed else "No positions resolved yet.")
             st.rerun()
     if st.button("Flatten book — clear all trades & reset balance"):
         if TRADE_LOG.exists():

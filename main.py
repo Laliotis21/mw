@@ -343,8 +343,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.reconcile:
-        n = reconcile_open()
-        logger.info("Reconciled %d open Binance bracket(s).", n)
+        n = len(reconcile_open())
+        logger.info("Reconciled %d open broker bracket(s).", n)
         import json
 
         print(json.dumps(performance_summary(), indent=2))
