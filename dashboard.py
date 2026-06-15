@@ -29,6 +29,7 @@ from config import MarketPhase, current_market_phase, settings
 from execution import (  # noqa: PLC2701
     TRADE_LOG,
     _load_log,
+    close_all_open,
     open_positions_count,
     performance_summary,
     reconcile_open,
@@ -402,6 +403,12 @@ def render_open_positions(df: pd.DataFrame) -> None:
         if c in view:
             fmts[c] = "{:+.1f}%"
     st.dataframe(styler.format(fmts, na_rep="—"), width="stretch", hide_index=True)
+
+    if st.button("✖ Close ALL positions (market)", key="close_all_btn"):
+        closed = close_all_open()
+        _toast_closed(closed)
+        st.toast(f"Closed {len(closed)} position(s).")
+        st.rerun()
 
 
 def render_blotter(df: pd.DataFrame) -> None:

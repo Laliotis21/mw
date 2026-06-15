@@ -65,40 +65,50 @@ def log_usage(usage: Optional[dict]) -> None:
     _save_log(log)
 
 
-def close_open(order_ref: str) -> Optional[dict]:
-    """
-    Manually close one open broker position, identified by its broker order id.
-    Flattens at the broker, realizes P&L into equity, marks the record. Returns
-    {asset, result, pnl} or None if not found / broker error.
-    """
-    import alpaca_broker
+def _apply_close(t: dict, log: dict) -> Optional[dict]:
+    """Close one open record at the broker + roll P&L into equity (no save)."""
+    src = t.get("fill_source", "")
+    if src.startswith("alpaca"):
+        import alpaca_broker
+        out = alpaca_broker.close_position(t)
+    else:
+        logger.warning("Manual close not supported for venue %s.", src)
+        return None
+    if out is None:
+        return None
+    result, exit_price, pnl = out
+    t["result"] = result
+    t["exit_price"] = exit_price
+    t["pnl"] = pnl
+    new_equity = round(log["meta"]["equity"] + pnl, 2)
+    t["equity_after"] = new_equity
+    log["meta"]["equity"] = new_equity
+    logger.info("MANUAL CLOSE %s %s pnl=$%.2f equity=$%.2f",
+                t["asset"], result, pnl, new_equity)
+    return {"asset": t["asset"], "result": result, "pnl": pnl}
 
+
+def close_open(order_ref: str) -> Optional[dict]:
+    """Manually close one open broker position by its broker order id."""
     log = _load_log()
     for t in log["trades"]:
-        if t.get("result") != "open":
-            continue
-        if order_ref not in (t.get("alpaca_order_id"), t.get("binance_order_list_id")):
-            continue
-        src = t.get("fill_source", "")
-        if src.startswith("alpaca"):
-            out = alpaca_broker.close_position(t)
-        else:
-            logger.warning("Manual close not supported for venue %s.", src)
-            return None
-        if out is None:
-            return None
-        result, exit_price, pnl = out
-        t["result"] = result
-        t["exit_price"] = exit_price
-        t["pnl"] = pnl
-        new_equity = round(log["meta"]["equity"] + pnl, 2)
-        t["equity_after"] = new_equity
-        log["meta"]["equity"] = new_equity
-        _save_log(log)
-        logger.info("MANUAL CLOSE %s %s pnl=$%.2f equity=$%.2f",
-                    t["asset"], result, pnl, new_equity)
-        return {"asset": t["asset"], "result": result, "pnl": pnl}
+        if t.get("result") == "open" and order_ref in (
+                t.get("alpaca_order_id"), t.get("binance_order_list_id")):
+            res = _apply_close(t, log)
+            if res:
+                _save_log(log)
+            return res
     return None
+
+
+def close_all_open() -> list[dict]:
+    """Close EVERY open broker position now. Returns the list of closed trades."""
+    log = _load_log()
+    results = [r for t in log["trades"] if t.get("result") == "open"
+               if (r := _apply_close(t, log))]
+    if results:
+        _save_log(log)
+    return results
 
 
 def set_last_run(summary: dict) -> None:
