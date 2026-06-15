@@ -24,6 +24,8 @@ from specs_loader import backstory_for
 from tools import (
     crypto_scanner_tool,
     market_scanner_tool,
+    position_sizer_tool,
+    price_technicals_tool,
     stock_scanner_tool,
     world_events_tool,
 )
@@ -124,6 +126,7 @@ def build_opportunity_ranker() -> Agent:
         ),
         backstory=backstory_for("opportunity_ranker"),
         llm=_llm(temperature=0.2),
+        tools=[price_technicals_tool],  # confirm top candidates are real + liquid
         allow_delegation=False,
         verbose=True,
         max_iter=3,
@@ -159,6 +162,7 @@ def build_analyst() -> Agent:
         ),
         backstory=backstory_for("analyst"),  # full spec from specs/analyst.md
         llm=_llm(temperature=0.3),
+        tools=[price_technicals_tool],  # anchor entry/stop/target to real levels
         allow_delegation=False,
         verbose=True,
         max_iter=3,
@@ -178,6 +182,7 @@ def build_risk_officer() -> Agent:
         ),
         backstory=backstory_for("risk_officer"),  # full spec from specs/risk_officer.md
         llm=_llm(temperature=0.0),  # deterministic — this is arithmetic
+        tools=[position_sizer_tool],  # exact, risk-capped sizing (no LLM math errors)
         allow_delegation=False,
         verbose=True,
         max_iter=3,

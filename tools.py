@@ -325,6 +325,108 @@ def world_events_tool(market_phase: str) -> str:
     return world_scan(market_phase=market_phase)
 
 
+@tool("Price & Technicals")
+def price_technicals_tool(asset: str) -> str:
+    """
+    Snapshot of real price + technical levels for one asset, to anchor a trade's
+    entry/stop/target to actual market structure instead of guessing.
+
+    Args:
+        asset: Ticker, e.g. 'AAPL' or 'BTC-USD'.
+
+    Returns:
+        JSON string with: last_price, day_high, day_low, atr14 (avg true range,
+        a volatility-based stop distance), recent_high / recent_low (20-bar
+        support/resistance), rsi14, and atr-based suggested_stop_long /
+        suggested_stop_short. degraded=true with reason if no price data.
+    """
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker(asset).history(period="1mo", interval="1d")
+        if df is None or df.empty or len(df) < 15:
+            return json.dumps({"asset": asset, "degraded": True,
+                               "reason": "no/insufficient price data"})
+        close, high, low = df["Close"], df["High"], df["Low"]
+        last = float(close.iloc[-1])
+        atr = float((high - low).tail(14).mean())  # simple ATR proxy
+        hi20, lo20 = float(high.tail(20).max()), float(low.tail(20).min())
+        delta = close.diff()
+        gain = float(delta.clip(lower=0).tail(14).mean())
+        loss = float((-delta.clip(upper=0)).tail(14).mean())
+        rsi = 100.0 if loss == 0 else round(100 - 100 / (1 + gain / loss), 1)
+        return json.dumps({
+            "asset": asset,
+            "last_price": round(last, 4),
+            "day_high": round(float(high.iloc[-1]), 4),
+            "day_low": round(float(low.iloc[-1]), 4),
+            "atr14": round(atr, 4),
+            "recent_high": round(hi20, 4),
+            "recent_low": round(lo20, 4),
+            "rsi14": rsi,
+            "suggested_stop_long": round(last - 1.5 * atr, 4),
+            "suggested_stop_short": round(last + 1.5 * atr, 4),
+            "degraded": False,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error("price_technicals failed for %s: %s", asset, exc)
+        return json.dumps({"asset": asset, "degraded": True, "reason": str(exc)})
+
+
+@tool("Position Sizer")
+def position_sizer_tool(entry_price: float, stop_loss: float,
+                        take_profit: float = 0.0) -> str:
+    """
+    Compute EXACT, risk-capped position sizing — use this instead of doing the
+    arithmetic yourself. Enforces the hard per-trade dollar-risk cap and no
+    leverage (notional <= account capital).
+
+    Args:
+        entry_price: Intended entry.
+        stop_loss: Protective stop (its side of entry implies long/short).
+        take_profit: Optional target. If omitted or reward:risk < 1.5, a 1.5R
+            take_profit is suggested.
+
+    Returns:
+        JSON string with: quantity, risk_dollars, risk_pct, reward_risk_ratio,
+        suggested_take_profit, capital_at_open, max_risk_dollars. Copy these
+        straight into the ExecutionTicket.
+    """
+    from config import cap_quantity
+    from execution import current_equity
+
+    try:
+        entry, stop = float(entry_price), float(stop_loss)
+        tp = float(take_profit) if take_profit else 0.0
+        per_unit = abs(entry - stop)
+        capital = current_equity()
+        max_risk = settings.MAX_RISK_DOLLARS
+        if entry <= 0 or per_unit <= 0:
+            return json.dumps({"error": "entry and stop must be positive and differ"})
+
+        is_long = stop < entry
+        qty = cap_quantity(max_risk / per_unit, entry, capital)  # no leverage
+        risk_dollars = round(qty * per_unit, 2)
+        # Ensure >= 1.5R target on the correct side.
+        min_tp = entry + 1.5 * per_unit if is_long else entry - 1.5 * per_unit
+        rr_in = abs(tp - entry) / per_unit if tp else 0.0
+        suggested_tp = round(tp if rr_in >= 1.5 else min_tp, 4)
+        rr = round(abs(suggested_tp - entry) / per_unit, 2)
+        return json.dumps({
+            "quantity": round(qty, 4),
+            "risk_dollars": risk_dollars,
+            "risk_pct": round(risk_dollars / capital, 4) if capital else 0.0,
+            "reward_risk_ratio": rr,
+            "suggested_take_profit": suggested_tp,
+            "capital_at_open": round(capital, 2),
+            "max_risk_dollars": max_risk,
+            "direction": "long" if is_long else "short",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error("position_sizer failed: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
 @tool("Stock Movers Scanner")
 def stock_scanner_tool(market_phase: str) -> str:
     """
