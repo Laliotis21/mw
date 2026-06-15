@@ -6,7 +6,21 @@ lock in the math (true ATR, Wilder RSI) that drives every rules-engine trade.
 
 import pandas as pd
 
-from strategy import _true_atr, _wilder_rsi
+from strategy import _true_atr, _wilder_rsi, efficiency_ratio
+
+
+def test_efficiency_ratio_straight_line_is_one():
+    close = pd.Series([float(i) for i in range(21)])  # perfectly clean trend
+    assert efficiency_ratio(close, period=20) == 1.0
+
+
+def test_efficiency_ratio_chop_is_near_zero():
+    close = pd.Series([0.0, 1.0] * 11)  # pure zigzag, no net progress
+    assert efficiency_ratio(close, period=20) < 0.1
+
+
+def test_efficiency_ratio_thin_history_is_zero():
+    assert efficiency_ratio([1.0, 2.0, 3.0], period=20) == 0.0
 
 
 def test_wilder_rsi_all_gains_is_100():

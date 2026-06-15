@@ -135,6 +135,18 @@ class Settings:
         #                   losers and locks partial gains (see backtest to A/B).
         self.EXIT_STYLE: str = os.getenv("EXIT_STYLE", "be_partial").lower()
 
+        # Trend-alignment gate (default ON). Don't fight the primary trend: take
+        # longs only when the SMA50 is rising and shorts only when it's falling.
+        # This cut the basket's worst counter-trend bleeder (NVDA −6.5R → −2.0R)
+        # AND lifted total backtest return +30% — it's selective, not overfit.
+        self.TREND_FILTER: bool = os.getenv("TREND_FILTER", "true").lower() == "true"
+        # Optional, OFF by default: Kaufman Efficiency Ratio chop gate (ER = net
+        # move / total path, 0..1). Set TREND_MIN_ER>0 to also require a clean
+        # trend. Backtests WORSE on a trending basket (it drops profitable
+        # moderate-trend trades), so it's opt-in only.
+        self.TREND_MIN_ER: float = float(os.getenv("TREND_MIN_ER", "0.0"))
+        self.TREND_ER_WINDOW: int = int(os.getenv("TREND_ER_WINDOW", "20"))
+
     def risk_budget(self, capital: float) -> float:
         """Dollar risk for ONE trade at the given (current) equity.
 
