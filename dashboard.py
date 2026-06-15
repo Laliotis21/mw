@@ -64,6 +64,14 @@ st.markdown(
     #MainMenu, footer, header { visibility:hidden; }
     .block-container { padding-top:1rem; padding-bottom:2rem; max-width:1500px; }
 
+    /* Kill the "running" dim: auto-refresh fetches data each tick, and Streamlit
+       fades stale elements + shows a running overlay during the rerun. Keep
+       everything at full opacity and hide the overlay so live updates don't grey
+       the screen. */
+    [data-stale="true"], .stApp [data-stale="true"] { opacity:1 !important; }
+    [data-testid="stStatusWidget"] { display:none !important; }
+    .stApp [data-testid="stAppViewBlockContainer"] { opacity:1 !important; }
+
     .topbar {
         display:flex; align-items:center; justify-content:space-between;
         padding:.55rem .9rem; border:1px solid var(--border); border-radius:8px;
