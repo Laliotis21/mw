@@ -27,9 +27,12 @@ import sys
 from crewai import Crew, Process
 
 from config import (
+    Action,
     ExecutionTicket,
     MarketPhase,
     OpportunityShortlist,
+    TradeSignal,
+    current_market_phase,
     logger,
     settings,
 )
@@ -73,6 +76,20 @@ def pop_last_usage() -> dict:
     return u
 
 
+def _merge_usage(a: dict, b: dict) -> dict:
+    """Sum two token-usage bundles (e.g. analysis crew + risk crew)."""
+    if not a:
+        return b or {}
+    if not b:
+        return a
+    out = dict(a)
+    for k in ("prompt_tokens", "completion_tokens", "cached_tokens",
+              "total_tokens", "requests"):
+        out[k] = (a.get(k, 0) or 0) + (b.get(k, 0) or 0)
+    out["model"] = b.get("model") or a.get("model")
+    return out
+
+
 def run_cycle(
     asset: str,
     market_phase: str,
@@ -100,37 +117,76 @@ def run_cycle(
 
     researcher = build_researcher()
     analyst = build_analyst()
-    risk_officer = build_risk_officer()
 
     research_task = build_research_task(researcher, asset, market_phase)
     analysis_task = build_analysis_task(analyst, asset, research_task)
-    risk_task = build_risk_task(risk_officer, asset, analysis_task)
 
-    crew = Crew(
-        agents=[researcher, analyst, risk_officer],
-        tasks=[research_task, analysis_task, risk_task],
+    # Stage 1: research -> signal. We inspect the analyst's call BEFORE paying
+    # for the risk agent — a HOLD needs no sizing, so we skip that LLM entirely.
+    desk_crew = Crew(
+        agents=[researcher, analyst],
+        tasks=[research_task, analysis_task],
         process=Process.sequential,
         verbose=True,
         step_callback=step_callback,
         task_callback=task_callback,
     )
-
     try:
-        result = crew.kickoff()
+        signal_res = desk_crew.kickoff()
     except Exception as exc:  # noqa: BLE001
-        logger.error("Crew kickoff failed for %s: %s", asset, exc)
+        logger.error("Research/analysis crew failed for %s: %s", asset, exc)
         return None
+    usage = _usage_dict(getattr(signal_res, "token_usage", None))
 
-    _LAST_USAGE = _usage_dict(getattr(result, "token_usage", None))
-
-    # CrewAI exposes the last task's pydantic output here.
-    ticket = getattr(result, "pydantic", None)
-    if not isinstance(ticket, ExecutionTicket):
-        # Fallback: try parsing raw JSON the model emitted.
+    signal = getattr(signal_res, "pydantic", None)
+    if not isinstance(signal, TradeSignal):
         try:
-            ticket = ExecutionTicket.model_validate_json(str(result))
+            signal = TradeSignal.model_validate_json(str(signal_res))
         except Exception as exc:  # noqa: BLE001
-            logger.error("No valid ExecutionTicket from crew for %s: %s", asset, exc)
+            logger.error("No valid TradeSignal for %s: %s", asset, exc)
+            _LAST_USAGE = usage
+            return None
+
+    # HOLD short-circuit: build a stand-down ticket directly — no risk LLM call.
+    if signal.action == Action.HOLD:
+        _LAST_USAGE = usage
+        logger.info("HOLD %s — skipping risk agent (no sizing needed).", asset)
+        return ExecutionTicket(
+            asset=asset, action=Action.HOLD,
+            entry_price=signal.suggested_entry or 0.0,
+            stop_loss=signal.suggested_stop or 0.0,
+            take_profit=signal.suggested_target or 0.0,
+            quantity=0.0, risk_dollars=0.0, risk_pct=0.0,
+            reward_risk_ratio=0.0, capital_at_open=current_equity(),
+            rationale=signal.rationale,
+        )
+
+    # Stage 2: size the trade (BUY/SELL only). Signal is embedded in the task,
+    # so the risk agent runs in its own crew with no cross-crew context.
+    risk_officer = build_risk_officer()
+    risk_task = build_risk_task(risk_officer, asset, signal)
+    risk_crew = Crew(
+        agents=[risk_officer],
+        tasks=[risk_task],
+        process=Process.sequential,
+        verbose=True,
+        step_callback=step_callback,
+        task_callback=task_callback,
+    )
+    try:
+        risk_res = risk_crew.kickoff()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Risk crew failed for %s: %s", asset, exc)
+        _LAST_USAGE = usage
+        return None
+    _LAST_USAGE = _merge_usage(usage, _usage_dict(getattr(risk_res, "token_usage", None)))
+
+    ticket = getattr(risk_res, "pydantic", None)
+    if not isinstance(ticket, ExecutionTicket):
+        try:
+            ticket = ExecutionTicket.model_validate_json(str(risk_res))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("No valid ExecutionTicket from risk crew for %s: %s", asset, exc)
             return None
 
     logger.info(
@@ -253,8 +309,8 @@ def main() -> int:
     parser.add_argument(
         "--phase",
         choices=[p.value for p in MarketPhase],
-        default=MarketPhase.OPEN.value,
-        help="Market phase for the cycle.",
+        default=None,
+        help="Market phase. Omit to auto-detect from the live US market clock.",
     )
     parser.add_argument(
         "--discover",
@@ -315,6 +371,11 @@ def main() -> int:
     if settings.FILL_SOURCE in ("binance", "alpaca", "live"):
         reconcile_open()
 
+    # Phase: use --phase if given, else auto-detect from the live market clock.
+    phase = args.phase or current_market_phase().value
+    if not args.phase:
+        logger.info("Auto-detected market phase from US clock: %s", phase)
+
     day_open_equity = current_equity()
     logger.info(
         "Run start | equity=$%.2f | risk cap/trade=$%.2f | daily stop=%.0f%%",
@@ -326,7 +387,7 @@ def main() -> int:
     # Build the asset list. --discover replaces the manual list with the scouts'
     # ranked shortlist; otherwise we trade exactly what the user passed.
     if args.discover:
-        shortlist = run_discovery(args.phase)
+        shortlist = run_discovery(phase)
         log_usage(pop_last_usage())  # attribute scout tokens to the run ledger
         if shortlist is None or not shortlist.ideas:
             logger.warning("Discovery produced no tradable ideas — nothing to do.")
@@ -340,13 +401,13 @@ def main() -> int:
     for asset in assets:
         if _circuit_breaker_tripped(day_open_equity):
             break
-        ticket = run_cycle(asset, args.phase)
+        ticket = run_cycle(asset, phase)
         usage = pop_last_usage()
         if ticket is None:
             log_usage(usage)  # crew still burned tokens even with no ticket
             logger.warning("Skipping execution for %s — no valid ticket.", asset)
             continue
-        execute_ticket(ticket, market_phase=args.phase, usage=usage)
+        execute_ticket(ticket, market_phase=phase, usage=usage)
 
     print("\n=== PERFORMANCE SUMMARY ===")
     import json

@@ -99,7 +99,7 @@ class Settings:
         #   SCAN_PER_SOURCE: candidates pulled per source (per screener / coin page)
         #   MAX_CANDIDATES:  top-N shortlisted ideas the desk actually trades
         self.SCAN_PER_SOURCE: int = int(os.getenv("SCAN_PER_SOURCE", "10"))
-        self.MAX_CANDIDATES: int = int(os.getenv("MAX_CANDIDATES", "5"))
+        self.MAX_CANDIDATES: int = int(os.getenv("MAX_CANDIDATES", "3"))
 
         # Derived: absolute dollar risk cap per trade. The whole risk engine
         # keys off this single number ($20 on a $1000 / 2% book).
@@ -139,6 +139,32 @@ class MarketPhase(str, Enum):
     OPEN = "open"
     MID_DAY = "mid_day"
     CLOSE = "close"
+
+
+def current_market_phase() -> "MarketPhase":
+    """
+    Detect the US-equity session phase from the wall clock (New York, DST-aware)
+    so the bot picks its own phase instead of the user choosing. Boundaries (ET):
+        04:00-09:30 pre_market | 09:30-11:00 open | 11:00-15:00 mid_day
+        15:00-16:00 close      | otherwise (overnight) -> pre_market (next session)
+    Crypto trades 24/7, but the same intraday rhythm is a fine proxy.
+    """
+    from datetime import time as _t
+    from zoneinfo import ZoneInfo
+
+    try:
+        et = datetime.now(ZoneInfo("America/New_York")).time()
+    except Exception:  # noqa: BLE001 — tz db missing; fall back to a sane default
+        return MarketPhase.MID_DAY
+    if _t(4, 0) <= et < _t(9, 30):
+        return MarketPhase.PRE_MARKET
+    if _t(9, 30) <= et < _t(11, 0):
+        return MarketPhase.OPEN
+    if _t(11, 0) <= et < _t(15, 0):
+        return MarketPhase.MID_DAY
+    if _t(15, 0) <= et < _t(16, 0):
+        return MarketPhase.CLOSE
+    return MarketPhase.PRE_MARKET
 
 
 class Action(str, Enum):

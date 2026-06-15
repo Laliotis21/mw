@@ -73,7 +73,7 @@ def build_world_scout() -> Agent:
         tools=[world_events_tool],
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -91,7 +91,7 @@ def build_stock_scanner() -> Agent:
         tools=[stock_scanner_tool],
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -109,7 +109,7 @@ def build_crypto_scanner() -> Agent:
         tools=[crypto_scanner_tool],
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -129,7 +129,7 @@ def build_opportunity_ranker() -> Agent:
         tools=[price_technicals_tool],  # confirm top candidates are real + liquid
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -147,7 +147,7 @@ def build_researcher() -> Agent:
         tools=[market_scanner_tool],
         allow_delegation=False,
         verbose=True,
-        max_iter=4,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -165,7 +165,7 @@ def build_analyst() -> Agent:
         tools=[price_technicals_tool],  # anchor entry/stop/target to real levels
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )
 
 
@@ -185,5 +185,5 @@ def build_risk_officer() -> Agent:
         tools=[position_sizer_tool],  # exact, risk-capped sizing (no LLM math errors)
         allow_delegation=False,
         verbose=True,
-        max_iter=3,
+        max_iter=2,  # one tool round-trip + final answer — caps ReAct loop cost
     )

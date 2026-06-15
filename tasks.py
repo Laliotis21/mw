@@ -153,7 +153,12 @@ def build_analysis_task(agent, asset: str, research_task: Task) -> Task:
     )
 
 
-def build_risk_task(agent, asset: str, analysis_task: Task) -> Task:
+def build_risk_task(agent, asset: str, signal: TradeSignal) -> Task:
+    """
+    Size + risk-gate a NON-HOLD signal. The analyst's decision is embedded
+    directly (no CrewAI context dependency) so this task runs in its own crew —
+    HOLD signals are short-circuited upstream and never reach here.
+    """
     cap = settings.STARTING_CAPITAL
     max_risk = settings.MAX_RISK_DOLLARS
     return Task(
@@ -161,21 +166,20 @@ def build_risk_task(agent, asset: str, analysis_task: Task) -> Task:
             f"You are the final gate before execution for '{asset}'. Account "
             f"capital is ${cap}. HARD RULE: risk on this trade must not exceed "
             f"${max_risk} ({settings.MAX_RISK_PCT:.0%} of capital).\n\n"
-            f"IMPORTANT: You must RESPECT the analyst's action. Your job is sizing "
-            f"and risk, NOT second-guessing direction. Keep action exactly as the "
-            f"analyst set it. Only the analyst may choose HOLD.\n\n"
-            f"Given the analyst's TradeSignal:\n"
-            f"  - If action is HOLD: emit a ticket with quantity 0 and zero risk, "
-            f"echoing entry/stop/target as the signal's values.\n"
-            f"  - If BUY/SELL (keep this action): call the Position Sizer tool "
-            f"with the analyst's entry_price, stop_loss, and take_profit. Copy its "
+            f"The analyst's decision (RESPECT the action exactly — your job is "
+            f"sizing, NOT direction; do NOT downgrade to HOLD):\n"
+            f"  action={signal.action.value}\n"
+            f"  suggested_entry={signal.suggested_entry}\n"
+            f"  suggested_stop={signal.suggested_stop}\n"
+            f"  suggested_target={signal.suggested_target}\n"
+            f"  rationale={signal.rationale!r}\n\n"
+            f"Call the Position Sizer tool with entry_price=suggested_entry, "
+            f"stop_loss=suggested_stop, take_profit=suggested_target. Copy its "
             f"returned quantity, risk_dollars, risk_pct, reward_risk_ratio, "
             f"suggested_take_profit (use as take_profit), and capital_at_open "
-            f"straight into the ticket — do NOT hand-calculate. The tool already "
-            f"enforces the ${max_risk} risk cap, no leverage, and a >=1.5 "
-            f"reward:risk target.\n"
-            f"  - Do NOT downgrade a BUY/SELL to HOLD. The price geometry will be "
-            f"re-anchored to live prices at execution, so just size it.\n\n"
+            f"straight into the ticket — do NOT hand-calculate. The tool enforces "
+            f"the ${max_risk} risk cap, no leverage, and a >=1.5 reward:risk "
+            f"target. Keep entry_price=suggested_entry and stop_loss=suggested_stop.\n\n"
             f"Emit ONLY a strict JSON ExecutionTicket. No prose outside the JSON."
         ),
         expected_output=(
@@ -185,6 +189,5 @@ def build_risk_task(agent, asset: str, analysis_task: Task) -> Task:
             "risk_dollars must be <= the hard cap."
         ),
         agent=agent,
-        context=[analysis_task],
         output_pydantic=ExecutionTicket,
     )

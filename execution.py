@@ -65,6 +65,13 @@ def log_usage(usage: Optional[dict]) -> None:
     _save_log(log)
 
 
+def set_last_run(summary: dict) -> None:
+    """Persist a one-line summary of the most recent run for the dashboard."""
+    log = _load_log()
+    log["meta"]["last_run"] = summary
+    _save_log(log)
+
+
 # --------------------------------------------------------------------------- #
 # Persistence helpers — the log is a single JSON doc: {meta, trades:[...]}.
 # --------------------------------------------------------------------------- #

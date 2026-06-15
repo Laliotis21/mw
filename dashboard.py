@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
-from config import MarketPhase, settings
+from config import MarketPhase, current_market_phase, settings
 from execution import TRADE_LOG, performance_summary, _load_log  # noqa: PLC2701
 
 st.set_page_config(
@@ -230,6 +230,37 @@ def ledger_html(meta: dict) -> str:
             f'margin:-.3rem 0 .9rem;background:#0c121b">⛁ {inner}</div>')
 
 
+def last_run_html(meta: dict) -> str:
+    """One-line summary of the most recent run: when, phase, what it did, cost."""
+    r = meta.get("last_run")
+    if not r:
+        return ('<div style="font-family:Fira Code,monospace;font-size:.68rem;color:#6e7d92;'
+                'margin:-.4rem 0 .9rem">🗒 LAST RUN  —  none yet. Press EXECUTE.</div>')
+    try:
+        when = pd.to_datetime(r.get("timestamp_utc"), utc=True).strftime("%m-%d %H:%M UTC")
+    except Exception:  # noqa: BLE001
+        when = r.get("timestamp_utc", "—")
+    pnl = r.get("pnl", 0.0)
+    pcls = "up" if pnl > 0 else ("down" if pnl < 0 else "flat")
+    assets = ", ".join(a for a in r.get("assets", []) if a) or "—"
+    parts = [
+        ("WHEN", when, ""),
+        ("PHASE", str(r.get("phase", "")).upper(), ""),
+        ("MODE", r.get("mode", ""), ""),
+        ("PROCESSED", f"{r.get('processed',0)} ({r.get('traded',0)} trade / {r.get('held',0)} hold)", ""),
+        ("RUN P&L", f"${pnl:+,.2f}", pcls),
+        ("RUN COST", f"${r.get('cost_usd',0.0):,.4f}", ""),
+    ]
+    inner = "   ·   ".join(
+        f'<span style="color:#6e7d92">{k}</span> '
+        f'<span class="{cls}" style="color:#c9d6e3">{v}</span>' for k, v, cls in parts
+    )
+    return (f'<div style="font-family:Fira Code,monospace;font-size:.7rem;'
+            f'border:1px solid #1c2735;border-radius:6px;padding:.4rem .7rem;'
+            f'margin:-.3rem 0 .9rem;background:#0c121b">🗒 {inner}'
+            f'<span style="color:#6e7d92">   ·   {assets}</span></div>')
+
+
 def _show_trade_result(asset: str, ticket, record) -> None:
     action = ticket.action.value
     if action == "HOLD" or record["quantity"] == 0:
@@ -349,6 +380,7 @@ def header_kpi() -> None:
     st.markdown(topbar_html(live), unsafe_allow_html=True)
     st.markdown(kpi_html(performance_summary(), df), unsafe_allow_html=True)
     st.markdown(ledger_html(log["meta"]), unsafe_allow_html=True)
+    st.markdown(last_run_html(log["meta"]), unsafe_allow_html=True)
 
 
 header_kpi()
@@ -369,12 +401,24 @@ with left:
     else:
         asset = st.text_input("Ticker", value="AAPL", label_visibility="collapsed",
                               placeholder="AAPL / BTC-USD").strip().upper()
-    PHASE_LABELS = {"pre_market": "🌅 PRE", "open": "🔔 OPEN", "mid_day": "☀️ MID", "close": "🌆 CLOSE"}
-    st.markdown('<div style="font-size:.62rem;letter-spacing:.13em;color:#6e7d92;text-transform:uppercase;margin-top:.4rem">Session</div>', unsafe_allow_html=True)
-    _picked = st.segmented_control("Session", options=[p.value for p in MarketPhase],
-                                   format_func=lambda v: PHASE_LABELS.get(v, v),
-                                   default="open", label_visibility="collapsed")
-    phase = _picked or "open"
+    # Phase auto-detected from the live US-market clock — the user shouldn't
+    # have to choose it. A small override is available for manual testing.
+    PHASE_LABELS = {"pre_market": "🌅 PRE-MARKET", "open": "🔔 OPEN", "mid_day": "☀️ MID-DAY", "close": "🌆 CLOSE"}
+    detected = current_market_phase().value
+    phase = detected
+    st.markdown(
+        f'<div style="margin-top:.5rem;font-family:Fira Code,monospace;font-size:.72rem;'
+        f'border:1px solid #1c2735;border-radius:6px;padding:.35rem .6rem;background:#0c121b">'
+        f'<span style="color:#6e7d92">SESSION (auto)</span> '
+        f'<span style="color:#3b82f6;font-weight:600">{PHASE_LABELS.get(detected, detected)}</span> '
+        f'<span style="color:#6e7d92">· from US market clock</span></div>',
+        unsafe_allow_html=True,
+    )
+    if st.checkbox("override phase", value=False):
+        _picked = st.segmented_control("Session", options=[p.value for p in MarketPhase],
+                                       format_func=lambda v: PHASE_LABELS.get(v, v),
+                                       default=detected, label_visibility="collapsed")
+        phase = _picked or detected
     btn_label = "▶  SCOUT & TRADE" if discover else "▶  EXECUTE CYCLE"
     run = st.button(btn_label, type="primary", width="stretch")
 
@@ -419,10 +463,12 @@ if run and (discover or asset):
                  "Add your key to .env (ANTHROPIC_API_KEY=sk-ant-…) and rerun.")
         st.stop()
 
-    from execution import execute_ticket, log_usage
+    from execution import execute_ticket, log_usage, set_last_run
     from main import pop_last_usage, run_cycle, run_discovery
 
     results = right.container()
+    cost0 = _load_log()["meta"].get("usage", {}).get("cost_usd", 0.0)
+    run_records: list[dict] = []
     try:
         if discover:
             with feed:
@@ -451,6 +497,7 @@ if run and (discover or asset):
                         results.warning(f"No valid decision for {idea.asset} — skipped.")
                         continue
                     record = execute_ticket(ticket, market_phase=phase, usage=cycle_usage)
+                    run_records.append(record)
                     with results:
                         _show_trade_result(idea.asset, ticket, record)
         else:
@@ -463,10 +510,27 @@ if run and (discover or asset):
                 results.error("The desk could not produce a valid decision. Try again.")
             else:
                 record = execute_ticket(ticket, market_phase=phase, usage=cycle_usage)
+                run_records.append(record)
                 with results:
                     _show_trade_result(asset, ticket, record)
     except Exception as exc:  # noqa: BLE001
         results.error(f"Run failed: {exc}")
+    finally:
+        # Persist a one-line summary of this run for the LAST RUN panel.
+        cost1 = _load_log()["meta"].get("usage", {}).get("cost_usd", 0.0)
+        traded = [r for r in run_records if r.get("result") not in ("no_trade", None)]
+        held = [r for r in run_records if r.get("result") == "no_trade"]
+        set_last_run({
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "mode": "discover" if discover else "single",
+            "processed": len(run_records),
+            "traded": len(traded),
+            "held": len(held),
+            "pnl": round(sum(r.get("pnl", 0.0) for r in run_records), 2),
+            "cost_usd": round(cost1 - cost0, 6),
+            "assets": [r.get("asset") for r in run_records],
+        })
 elif run and not discover and not asset:
     st.warning("Type a ticker first (e.g. AAPL or BTC-USD).")
 
