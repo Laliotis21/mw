@@ -17,6 +17,8 @@ volume/VWAP signals rather than emit garbage.
 
 from __future__ import annotations
 
+import threading
+import time as _time
 from typing import Optional
 
 import numpy as np
@@ -48,6 +50,42 @@ def phase_data(market_phase: str) -> tuple[str, str]:
     except ValueError:
         phase = MarketPhase.MID_DAY
     return PHASE_DATA[phase]
+
+
+# --------------------------------------------------------------------------- #
+# Shared price-history cache. A given (asset, period, interval) is often fetched
+# more than once in a cycle (e.g. the same asset re-scanned, or repeated calls
+# within the TTL); a short in-process cache serves the repeat from memory,
+# cutting latency and the chance of a yfinance rate-limit/ban.
+# Callers must treat the returned frame as read-only (they share one object).
+# --------------------------------------------------------------------------- #
+HISTORY_TTL_SEC = 60
+_hist_cache: dict[tuple[str, str, str], tuple[float, "pd.DataFrame"]] = {}
+_hist_lock = threading.Lock()
+
+
+def fetch_history(asset: str, period: str, interval: str) -> "pd.DataFrame":
+    """yfinance daily/intraday history with a short TTL cache (keyed by
+    asset+period+interval). Returns whatever yfinance returns; fetch errors
+    propagate so callers keep their existing try/except behaviour.
+
+    Empty results are NOT cached: a transient yfinance blip that returns an
+    empty frame must not suppress every consumer for the full TTL — the next
+    call retries instead.
+    """
+    key = (asset, period, interval)
+    with _hist_lock:
+        hit = _hist_cache.get(key)
+        if hit is not None and _time.time() - hit[0] < HISTORY_TTL_SEC:
+            return hit[1]
+    import yfinance as yf
+
+    df = yf.Ticker(asset).history(period=period, interval=interval)
+    # Stamp freshness at data-arrival, and only cache real data.
+    if df is not None and not df.empty:
+        with _hist_lock:
+            _hist_cache[key] = (_time.time(), df)
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -114,9 +152,7 @@ def candle_scan(asset: str, market_phase: str) -> dict:
     period, interval = PHASE_DATA[phase]
 
     try:
-        import yfinance as yf
-
-        df = yf.Ticker(asset).history(period=period, interval=interval)
+        df = fetch_history(asset, period, interval)
     except Exception as exc:  # noqa: BLE001
         logger.error("candle_scan fetch failed for %s: %s", asset, exc)
         df = None

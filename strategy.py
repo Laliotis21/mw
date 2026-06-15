@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import pandas as pd
+
 from config import (
     Action,
     AssetClass,
@@ -41,6 +43,44 @@ REWARD_RISK = 2.0
 # --------------------------------------------------------------------------- #
 # Indicators
 # --------------------------------------------------------------------------- #
+def _wilder_rsi(close: pd.Series, period: int = 14) -> float:
+    """RSI with Wilder's smoothing (the textbook definition) — the latest value.
+
+    A plain rolling mean over `period` reacts too sharply; Wilder smooths gains
+    and losses with an EMA of alpha = 1/period, which is what every charting
+    package reports, so our 45/72 thresholds line up with what a trader sees.
+    Returns a neutral 50.0 when there isn't enough history.
+    """
+    delta = close.diff().dropna()
+    if len(delta) < period:
+        return 50.0
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = float(gain.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+    avg_loss = float(loss.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100 - 100 / (1 + rs))
+
+
+def _true_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
+    """Average True Range (latest), the real definition that accounts for gaps.
+
+    True range = max(H-L, |H-prevClose|, |L-prevClose|), so an overnight gap
+    widens the stop instead of being ignored. A naive high-low mean under-sizes
+    stops on gappy names and triggers needless stop-outs.
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    tr = tr.dropna()
+    if tr.empty:
+        return float((high - low).tail(min(period, len(high))).mean())
+    return float(tr.tail(min(period, len(tr))).mean())
+
+
 def _indicators(asset: str) -> Optional[dict]:
     """
     Technical snapshot from real daily candles; None if there's too little data
@@ -48,9 +88,9 @@ def _indicators(asset: str) -> Optional[dict]:
     >=25 bars (`bars` is exposed so the caller can gate on it), but the momentum
     + catalyst path runs on thin history too.
     """
-    import yfinance as yf
+    from candles import fetch_history
 
-    df = yf.Ticker(asset).history(period="3mo", interval="1d")
+    df = fetch_history(asset, "3mo", "1d")
     if df is None or df.empty or len(df) < 6:
         return None
     close, high, low = df["Close"], df["High"], df["Low"]
@@ -58,16 +98,11 @@ def _indicators(asset: str) -> Optional[dict]:
     last = float(close.iloc[-1])
     sma20 = float(close.tail(min(20, bars)).mean())
     sma50 = float(close.tail(min(50, bars)).mean())
-    atr = float((high - low).tail(min(14, bars)).mean())
+    atr = _true_atr(high, low, close, period=min(14, bars))
     hi20 = float(high.tail(min(20, bars)).max())
     lo20 = float(low.tail(min(20, bars)).min())
-    if bars >= 15:
-        delta = close.diff()
-        gain = float(delta.clip(lower=0).tail(14).mean())
-        loss = float((-delta.clip(upper=0)).tail(14).mean())
-        rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
-    else:
-        rsi = 50.0  # neutral until there's enough history
+    # Wilder RSI needs ~15 bars to be meaningful; neutral 50 until then.
+    rsi = _wilder_rsi(close, period=14) if bars >= 15 else 50.0
     mom = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
     stop_dist = max(ATR_STOP_MULT * atr, last * 0.005)
     vol = df["Volume"]
