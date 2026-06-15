@@ -89,6 +89,8 @@ class Settings:
         # NEWS_SENTIMENT = 'keyword' (free) or 'llm' (1 cheap Haiku call/ticker).
         self.USE_NEWS: bool = os.getenv("USE_NEWS", "true").lower() == "true"
         self.NEWS_SENTIMENT: str = os.getenv("NEWS_SENTIMENT", "keyword").lower()
+        # Autonomous scheduler (scheduler.py): minutes between auto runs.
+        self.AUTORUN_INTERVAL_MIN: int = int(os.getenv("AUTORUN_INTERVAL_MIN", "30"))
         self.LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").lower()
         self.RESEARCH_SOURCE: str = os.getenv("RESEARCH_SOURCE", "perplexity").lower()
         # FILL_SOURCE: how paper fills resolve.
