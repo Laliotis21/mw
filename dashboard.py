@@ -373,11 +373,21 @@ def _fmt_time(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _live_prices(symbols: list[str]) -> dict:
-    """Latest price per symbol via yfinance fast_info. Missing on any failure."""
+    """
+    Latest price per symbol via yfinance, cached ~10s in session_state. Without
+    the cache the auto-refresh fragment fetches every 2-3s tick → the whole app
+    sits under Streamlit's 'running' dim almost constantly. Caching makes most
+    ticks instant.
+    """
+    import time as _t
+    want = set(symbols)
+    cache = st.session_state.get("_px_cache", {"ts": 0.0, "data": {}})
+    if _t.time() - cache["ts"] < 10 and want <= set(cache["data"]):
+        return cache["data"]
     out: dict[str, float] = {}
     try:
         import yfinance as yf
-        for s in set(symbols):
+        for s in want:
             try:
                 fi = yf.Ticker(s).fast_info
                 p = fi.get("lastPrice") or fi.get("last_price")
@@ -387,6 +397,7 @@ def _live_prices(symbols: list[str]) -> dict:
                 continue
     except Exception:  # noqa: BLE001
         pass
+    st.session_state["_px_cache"] = {"ts": _t.time(), "data": out}
     return out
 
 
